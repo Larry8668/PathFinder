@@ -2,5 +2,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    my_raycast_lib::run()
+    // Run the entry point from your shared lib
+    my_raycast_lib::run();
 }

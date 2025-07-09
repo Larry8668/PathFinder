@@ -12,9 +12,17 @@
   "app": {
     "windows": [
       {
-        "title": "my-raycast",
-        "width": 800,
-        "height": 600
+        "label": "main",
+        "url": "http://localhost:1420",
+        "transparent": true,
+        "decorations": false,
+        "resizable": false,
+        "fullscreen": false,
+        "width": 600,
+        "height": 180,
+        "alwaysOnTop": true,
+        "center": true,
+        "skipTaskbar": true
       }
     ],
     "security": {
