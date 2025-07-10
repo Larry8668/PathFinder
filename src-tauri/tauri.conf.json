@@ -18,8 +18,8 @@
         "decorations": false,
         "resizable": false,
         "fullscreen": false,
-        "width": 600,
-        "height": 180,
+        "width": 800,
+        "height": 250,
         "alwaysOnTop": true,
         "center": true,
         "skipTaskbar": true
