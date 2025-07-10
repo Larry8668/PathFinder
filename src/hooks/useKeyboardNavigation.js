@@ -1,13 +1,24 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 
 export function useKeyboardNavigation(items, onEnter, initialIndex = 0) {
   const [selectedIndex, setSelectedIndex] = useState(initialIndex);
   const itemCount = items?.length || 0;
+  const itemsRef = useRef(items);
 
-  // Reset selected index when items change
+  // Store a unique identifier for the current items array
+  const itemsSignature = useMemo(() => {
+    return items ? JSON.stringify(items.map(item => JSON.stringify(item))) : '';
+  }, [items]);
+
+  // Update the ref when items change
+  useEffect(() => {
+    itemsRef.current = items;
+  }, [items]);
+
+  // Reset selected index when items change (using the signature)
   useEffect(() => {
     setSelectedIndex(0);
-  }, [items]);
+  }, [itemsSignature]);
 
   // Handle keyboard navigation
   const handleKeyDown = useCallback((e) => {

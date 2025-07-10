@@ -1,5 +1,4 @@
 import { useKeyboardNavigation } from "../hooks/useKeyboardNavigation";
-
 import Fuse from "fuse.js";
 
 const OPTIONS = [
