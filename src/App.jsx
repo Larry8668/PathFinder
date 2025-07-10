@@ -18,6 +18,8 @@ function App() {
           getCurrentWindow().hide();
         } else {
           setCurrentPage("home");
+          setQuery("");
+          inputRef.current?.focus();
         }
       }
     }
@@ -47,7 +49,10 @@ function App() {
             <HomeOptions
               query={query}
               onSelect={setCurrentPage}
-              clearQuery={() => setQuery("")}
+              clearQuery={() => {
+                setQuery("");
+                inputRef.current?.focus();
+              }}
             />
           )}
           {currentPage === "clipboard" && <ClipboardPage query={query} />}

@@ -1,3 +1,5 @@
+import { useKeyboardNavigation } from "../hooks/useKeyboardNavigation";
+
 import Fuse from "fuse.js";
 
 const OPTIONS = [
@@ -13,26 +15,27 @@ export default function HomeOptions({ query, onSelect, clearQuery }) {
     ? fuse.search(query).map((result) => result.item)
     : OPTIONS;
 
+  const { getItemProps } = useKeyboardNavigation(filtered, (item) => {
+    onSelect(item.page);
+    clearQuery();
+  });
   return (
     <div className="option-list">
       {filtered.length ? (
         filtered.map((opt, idx) => (
           <div
-            className="option-item"
+            {...getItemProps(idx)}
+            className={`option-item ${getItemProps(idx).className}`}
             key={idx}
-            onClick={() => {
-              onSelect(opt.page);
-              clearQuery();
-            }}
           >
             <span className="icon">{opt.icon}</span>
             <span>{opt.title}</span>
           </div>
         ))
       ) : (
-        <div className="option-item">
+        <div className="option-item selected">
           <span className="icon">🌐</span>
-          <span>Search online for “{query}”</span>
+          <span>Search online for "{query}"</span>
         </div>
       )}
     </div>

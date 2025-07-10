@@ -1,3 +1,4 @@
+import { useKeyboardNavigation } from "../hooks/useKeyboardNavigation";
 import Fuse from "fuse.js";
 
 const dummyClips = [
@@ -13,10 +14,18 @@ export default function ClipboardPage({ query }) {
     ? fuse.search(query).map((res) => res.item)
     : dummyClips;
 
+  const { getItemProps } = useKeyboardNavigation(filtered, (item) => {
+    console.log("Selected:", item.text);
+  });
+
   return (
     <div className="option-list">
       {filtered.map((clip, idx) => (
-        <div className="option-item" key={idx}>
+        <div
+          {...getItemProps(idx)}
+          className={`option-item ${getItemProps(idx).className}`}
+          key={idx}
+        >
           <span className="icon">📄</span>
           <span>{clip.text}</span>
         </div>

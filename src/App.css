@@ -60,11 +60,17 @@
   background: rgba(255, 255, 255, 0.05);
   color: white;
   cursor: pointer;
-  transition: background 0.2s;
+  transition: all 0.2s ease;
 }
 
-.option-item:hover {
+.option-item:hover,
+.option-item.selected {
   background: rgba(255, 255, 255, 0.15);
+  transform: translateX(4px);
+}
+
+.option-item:active {
+  transform: scale(0.98);
 }
 
 .icon {
