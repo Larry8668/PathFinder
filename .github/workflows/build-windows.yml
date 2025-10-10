@@ -3,8 +3,6 @@ name: Build Windows App
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,12 +31,14 @@ jobs:
       
     - name: Install Rust dependencies
       run: cargo fetch
+      working-directory: src-tauri
       
     - name: Run frontend build
       run: npm run build
       
     - name: Run Tauri build
       run: npm run tauri:build
+      working-directory: .
       env:
         TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
         TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
