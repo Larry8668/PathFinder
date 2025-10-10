@@ -1,0 +1,72 @@
+name: Build Windows App
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+        
+    - name: Install frontend dependencies
+      run: npm ci
+      
+    - name: Install Rust dependencies
+      run: cargo fetch
+      
+    - name: Run frontend build
+      run: npm run build
+      
+    - name: Run Tauri build
+      run: npm run tauri:build
+      env:
+        TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+        TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        
+    - name: Upload MSI installer
+      uses: actions/upload-artifact@v4
+      with:
+        name: pathfinder-windows-msi-${{ github.sha }}
+        path: src-tauri/target/release/bundle/msi/*.msi
+        retention-days: 30
+        
+    - name: Upload NSIS installer
+      uses: actions/upload-artifact@v4
+      with:
+        name: pathfinder-windows-nsis-${{ github.sha }}
+        path: src-tauri/target/release/bundle/nsis/*.exe
+        retention-days: 30
+        
+    - name: Create Release
+      if: github.ref == 'refs/heads/main'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          src-tauri/target/release/bundle/msi/*.msi
+          src-tauri/target/release/bundle/nsis/*.exe
+        generate_release_notes: true
+        draft: true
+        tag_name: v${{ github.run_number }}
+        name: PathFinder v${{ github.run_number }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
