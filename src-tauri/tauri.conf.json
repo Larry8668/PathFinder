@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "my-raycast",
+  "productName": "PathFinder",
   "version": "0.1.0",
-  "identifier": "com.my-raycast.app",
+  "identifier": "com.pathfinder.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",

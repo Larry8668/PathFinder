@@ -3,5 +3,5 @@
 
 fn main() {
     // Run the entry point from your shared lib
-    my_raycast_lib::run();
+    pathfinder_lib::run();
 }
