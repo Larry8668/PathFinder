@@ -40,17 +40,9 @@ jobs:
       
     - name: Run Tauri build
       run: npm run tauri:build
-      working-directory: .
       env:
         TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
         TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
-        
-    - name: Upload DMG installer
-      uses: actions/upload-artifact@v4
-      with:
-        name: pathfinder-macos-dmg-${{ github.sha }}
-        path: src-tauri/target/release/bundle/dmg/*.dmg
-        retention-days: 30
         
     - name: Upload APP bundle
       uses: actions/upload-artifact@v4
