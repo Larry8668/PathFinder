@@ -54,9 +54,7 @@
       "exceptionDomain": null,
       "signingIdentity": null,
       "providerShortName": null,
-      "entitlements": null,
-      "hardenedRuntime": false,
-      "notarize": false
+      "entitlements": null
     },
     "linux": {
       "deb": {
