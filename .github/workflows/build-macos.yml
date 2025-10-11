@@ -1,0 +1,73 @@
+name: Build macOS App
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+        
+    - name: Install frontend dependencies
+      run: npm ci
+      
+    - name: Install Rust dependencies
+      run: cargo fetch
+      working-directory: src-tauri
+      
+    - name: Run frontend build
+      run: npm run build
+      
+    - name: Run Tauri build
+      run: npm run tauri:build
+      working-directory: .
+      env:
+        TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+        TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        
+    - name: Upload DMG installer
+      uses: actions/upload-artifact@v4
+      with:
+        name: pathfinder-macos-dmg-${{ github.sha }}
+        path: src-tauri/target/release/bundle/dmg/*.dmg
+        retention-days: 30
+        
+    - name: Upload APP bundle
+      uses: actions/upload-artifact@v4
+      with:
+        name: pathfinder-macos-app-${{ github.sha }}
+        path: src-tauri/target/release/bundle/macos/*.app
+        retention-days: 30
+        
+    - name: Create Release
+      if: github.ref == 'refs/heads/main'
+      continue-on-error: true
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          src-tauri/target/release/bundle/dmg/*.dmg
+          src-tauri/target/release/bundle/macos/*.app
+        generate_release_notes: true
+        draft: true
+        tag_name: v${{ github.run_number }}
+        name: PathFinder v${{ github.run_number }}
