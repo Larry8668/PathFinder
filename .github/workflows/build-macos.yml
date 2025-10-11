@@ -28,6 +28,13 @@ jobs:
       with:
         components: rustfmt, clippy
         
+    - name: Install system dependencies
+      run: |
+        # Install create-dmg for DMG creation
+        brew install create-dmg
+        # Install other dependencies that might be needed
+        brew install libiconv
+        
     - name: Install frontend dependencies
       run: npm ci
       
@@ -39,10 +46,26 @@ jobs:
       run: npm run build
       
     - name: Run Tauri build
-      run: npm run tauri:build
+      run: |
+        # Set environment variables to disable code signing
+        export TAURI_PRIVATE_KEY=""
+        export TAURI_KEY_PASSWORD=""
+        export MACOS_CERTIFICATE=""
+        export MACOS_CERTIFICATE_PASSWORD=""
+        export MACOS_SIGNING_IDENTITY=""
+        
+        # Run the build
+        npm run tauri:build
       env:
-        TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
-        TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        TAURI_PRIVATE_KEY: ""
+        TAURI_KEY_PASSWORD: ""
+        
+    - name: Upload DMG installer
+      uses: actions/upload-artifact@v4
+      with:
+        name: pathfinder-macos-dmg-${{ github.sha }}
+        path: src-tauri/target/release/bundle/dmg/*.dmg
+        retention-days: 30
         
     - name: Upload APP bundle
       uses: actions/upload-artifact@v4
