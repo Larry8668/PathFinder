@@ -1,0 +1,91 @@
+name: Create Release
+
+on:
+  workflow_run:
+    workflows: ["Build Windows App", "Build macOS App", "Build Linux App"]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  create-release:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Download Windows artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: pathfinder-windows-msi-${{ github.sha }}
+        path: ./artifacts/windows/msi
+        
+    - name: Download Windows NSIS artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: pathfinder-windows-nsis-${{ github.sha }}
+        path: ./artifacts/windows/nsis
+        
+    - name: Download macOS DMG artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: pathfinder-macos-dmg-${{ github.sha }}
+        path: ./artifacts/macos/dmg
+        
+    - name: Download macOS APP artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: pathfinder-macos-app-${{ github.sha }}
+        path: ./artifacts/macos/app
+        
+    - name: Download Linux AppImage artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: pathfinder-linux-appimage-${{ github.sha }}
+        path: ./artifacts/linux/appimage
+        
+    - name: Download Linux DEB artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: pathfinder-linux-deb-${{ github.sha }}
+        path: ./artifacts/linux/deb
+        
+    - name: Download Linux RPM artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: pathfinder-linux-rpm-${{ github.sha }}
+        path: ./artifacts/linux/rpm
+        
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          ./artifacts/windows/msi/*.msi
+          ./artifacts/windows/nsis/*.exe
+          ./artifacts/macos/dmg/*.dmg
+          ./artifacts/macos/app/*.app
+          ./artifacts/linux/appimage/*.AppImage
+          ./artifacts/linux/deb/*.deb
+          ./artifacts/linux/rpm/*.rpm
+        generate_release_notes: true
+        draft: true
+        tag_name: v${{ github.run_number }}
+        name: PathFinder v${{ github.run_number }}
+        body: |
+          ## PathFinder v${{ github.run_number }}
+          
+          Cross-platform desktop application built with Tauri.
+          
+          ### Downloads
+          - **Windows**: MSI installer and NSIS executable
+          - **macOS**: DMG installer and APP bundle
+          - **Linux**: AppImage, DEB, and RPM packages
+          
+          ### Installation
+          - **Windows**: Run the MSI installer or the NSIS executable
+          - **macOS**: Mount the DMG and drag the app to Applications
+          - **Linux**: Use your preferred package manager or run the AppImage
