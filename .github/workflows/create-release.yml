@@ -2,13 +2,14 @@ name: Create Release
 
 on:
   workflow_run:
-    workflows: ["Build Windows App", "Build macOS App", "Build Linux App"]
+    workflows: ["Build Windows App"]
     types: [completed]
     branches: [main]
 
 jobs:
   create-release:
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    # Only run if the triggering workflow was successful
+    if: github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -18,43 +19,54 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
       
+    - name: Wait for all builds to complete
+      run: |
+        echo "Waiting 30 seconds to ensure all builds have completed..."
+        sleep 30
+      
     - name: Download Windows artifacts
       uses: actions/download-artifact@v4
       with:
-        name: pathfinder-windows-msi-${{ github.sha }}
+        name: pathfinder-windows-msi-${{ github.event.workflow_run.head_sha }}
         path: ./artifacts/windows/msi
+      continue-on-error: true
         
     - name: Download Windows NSIS artifacts
       uses: actions/download-artifact@v4
       with:
-        name: pathfinder-windows-nsis-${{ github.sha }}
+        name: pathfinder-windows-nsis-${{ github.event.workflow_run.head_sha }}
         path: ./artifacts/windows/nsis
+      continue-on-error: true
         
     # DMG artifacts removed - using APP bundle only
         
     - name: Download macOS APP artifacts
       uses: actions/download-artifact@v4
       with:
-        name: pathfinder-macos-app-${{ github.sha }}
+        name: pathfinder-macos-app-${{ github.event.workflow_run.head_sha }}
         path: ./artifacts/macos/app
+      continue-on-error: true
         
     - name: Download Linux AppImage artifacts
       uses: actions/download-artifact@v4
       with:
-        name: pathfinder-linux-appimage-${{ github.sha }}
+        name: pathfinder-linux-appimage-${{ github.event.workflow_run.head_sha }}
         path: ./artifacts/linux/appimage
+      continue-on-error: true
         
     - name: Download Linux DEB artifacts
       uses: actions/download-artifact@v4
       with:
-        name: pathfinder-linux-deb-${{ github.sha }}
+        name: pathfinder-linux-deb-${{ github.event.workflow_run.head_sha }}
         path: ./artifacts/linux/deb
+      continue-on-error: true
         
     - name: Download Linux RPM artifacts
       uses: actions/download-artifact@v4
       with:
-        name: pathfinder-linux-rpm-${{ github.sha }}
+        name: pathfinder-linux-rpm-${{ github.event.workflow_run.head_sha }}
         path: ./artifacts/linux/rpm
+      continue-on-error: true
         
     - name: Create Release
       uses: softprops/action-gh-release@v1
