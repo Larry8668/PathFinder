@@ -8,7 +8,7 @@ const OPTIONS = [
 ];
 
 const fuse = new Fuse(OPTIONS, { keys: ["title"], threshold: 0.4 });
-
+ 
 export default function HomeOptions({ query, onSelect, clearQuery }) {
   const filtered = query
     ? fuse.search(query).map((result) => result.item)
