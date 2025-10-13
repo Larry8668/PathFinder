@@ -1,0 +1,51 @@
+# .coderabbit.yaml
+# Place this file in the root of your PathFinder repository
+
+# Use the assertive profile for the deepest, most comprehensive review
+reviews:
+  profile: "assertive"
+  
+  # Ensure automatic review is enabled for all new PRs
+  auto_review:
+    enabled: true
+    drafts: false
+    
+  # Enable advanced tools for static analysis and security checks (free for open-source)
+  tools:
+    # Essential for JavaScript/TypeScript/Web Framework code
+    eslint:
+      enabled: true
+    # Security scanner for all code, including detecting hardcoded secrets
+    gitleaks:
+      enabled: true
+    # Rust-specific linter/checker for the core application logic
+    clippy:
+      enabled: true
+
+  # Path filters to ignore common build and platform-specific generated files
+  # Exclude common build artifacts and non-code assets that don't need code review.
+  path_filters:
+    # Ignore build outputs
+    - "!**/node_modules/**"
+    - "!**/dist/**"
+    - "!**/target/**" # Rust build output
+    - "!**/src-tauri/target/**" # Common location for Rust build output
+    # Ignore configuration files that are auto-generated or non-essential for code quality review
+    - "!**/package-lock.json"
+    - "!**/yarn.lock"
+    
+  # Custom instructions to guide the AI reviewer
+  review_instructions: |
+    Perform a comprehensive code review focusing on the following for this Tauri (JS/TS + Rust) application:
+    
+    # 1. Tauri (Frontend/Backend Interop)
+    1. **Invocation Security:** Critically review all Rust `#[tauri::command]` functions to ensure arguments are validated and all file system or OS operations are safe and necessary.
+    2. **API Design:** Ensure the communication between the Frontend (JS/TS) and the Backend (Rust) is clear, minimal, and uses Tauri's API correctly (e.g., using `invoke` and proper error handling).
+
+    # 2. Frontend (JavaScript/TypeScript)
+    3. **UI Logic:** Review JavaScript/TypeScript for common anti-patterns, maintainability, and responsiveness for a desktop app feel.
+    4. **Type Safety:** For TypeScript, check for abuse of `any` and ensure interfaces/types are clear.
+
+    # 3. Backend (Rust)
+    5. **Rust Safety/Performance:** Look for `unwrap()`/`expect()` in application logic that should use proper error handling. Check for efficient use of Rust types and standard library features.
+    6. **Dependencies:** Review changes to `Cargo.toml` for necessary and secure crate versions.
