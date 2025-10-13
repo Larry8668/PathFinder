@@ -20,7 +20,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+tauri-plugin-clipboard-manager = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-global-shortcut = "2.3.0"
-
+uuid = { version = "1.0", features = ["v4"] }
+enigo = "0.2.0"
