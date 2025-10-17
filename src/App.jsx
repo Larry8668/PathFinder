@@ -59,7 +59,7 @@ function App() {
           {currentPage === "online-search" && (
             <OnlineSearchPage query={query} />
           )}
-          {currentPage === "open-file" && <OpenFilePage query={query} />}
+          {currentPage === "open-app" && <OpenFilePage query={query} />}
         </div>
       </div>
     </div>
