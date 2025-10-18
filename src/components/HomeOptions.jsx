@@ -4,7 +4,7 @@ import Fuse from "fuse.js";
 const OPTIONS = [
   { title: "Clipboard", icon: "📋", page: "clipboard" },
   { title: "Online Search", icon: "🔍", page: "online-search" },
-  { title: "Open File", icon: "📁", page: "open-file" },
+  { title: "Open App", icon: "📁", page: "open-app" },
 ];
 
 const fuse = new Fuse(OPTIONS, { keys: ["title"], threshold: 0.4 });
