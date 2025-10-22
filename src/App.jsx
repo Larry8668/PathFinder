@@ -14,7 +14,7 @@ import GuideEnd from "./pages/GuideEnd";
 
 function App() {
   const isFirstLaunch = useFirstLaunch();
-  console.log("isFirstLaunch:", isFirstLaunch);
+  // console.log("isFirstLaunch:", isFirstLaunch);
 
   
   const [query, setQuery] = useState("");
@@ -47,7 +47,6 @@ function App() {
       <BrowserRouter>
       <Routes>
         <Route path="/" element={isFirstLaunch ? <Welcome/> : <Home/>}/>
-        <Route path="/" element={<Welcome />} />
         <Route path="/home" element={<Home />} />
         <Route path="/welcome" element={<Welcome/>} />
         <Route path="/name" element={<Name/>} />

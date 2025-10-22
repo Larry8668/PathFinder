@@ -8,7 +8,7 @@ function GuideEnd(){
         <div className="text-center text-5xl">
             All done, continue to 
         </div>
-        <Link to='/'><button className="py-2 px-3 bg-black rounded-md text-center text-white text-5xl">Pathfinder</button></Link>
+        <Link to='/'><button type="button" className="py-2 px-3 bg-black rounded-md text-center text-white text-5xl">Pathfinder</button></Link>
         </div>
     )
 } 

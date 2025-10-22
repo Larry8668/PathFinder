@@ -26,5 +26,3 @@ serde_json = "1"
 tauri-plugin-global-shortcut = "2.3.0"
 uuid = { version = "1.0", features = ["v4"] }
 enigo = "0.2.0"
-walkdir = "2.4"
-dirs = "5.0"
