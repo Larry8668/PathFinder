@@ -15,7 +15,7 @@ const {
 
   const onSubmit = (data) => {
     localStorage.setItem("name", JSON.stringify(data))
-    console.log(localStorage.getItem("name"))
+    // console.log(localStorage.getItem("name"))
     navigate("/About");
 }
 
@@ -29,7 +29,7 @@ const {
                     defaultValue="" {...register("name")} type='text' placeholder="Type"/>
                 </form>
             </div>
-        <Link to='/About'><button className="absolute bottom-3 right-5 flex flex-row justify-center py-1 px-3 bg-black rounded-md text-center text-white ">next</button></Link>
+        <Link to='/About'><button type='submit' className="absolute bottom-3 right-5 flex flex-row justify-center py-1 px-3 bg-black rounded-md text-center text-white ">next</button></Link>
 
         </div>
     )
