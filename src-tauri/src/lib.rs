@@ -242,8 +242,7 @@ fn index_applications() -> Vec<FileItem> {
                 .into_iter()
                 .filter_map(|e| e.ok())
             {
-                let path = entry.path();
-                if is_app_file(&path.to_path_buf()) {
+                let path = entry.path();                if is_app_file(&path.to_path_buf()) {
                     if let (Ok(metadata), Some(name)) = (path.metadata(), path.file_name().and_then(|n| n.to_str())) {
                         let modified = metadata
                             .modified()
@@ -497,6 +496,12 @@ fn refresh_file_index(
     Ok(())
 }
 
+#[tauri::command]
+fn hide_window(app: tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+}
 fn start_clipboard_monitor(app_handle: tauri::AppHandle, db: Arc<Mutex<ClipboardDatabase>>) {
     std::thread::spawn(move || {
         let mut last_content = String::new();
@@ -545,8 +550,31 @@ fn start_clipboard_monitor(app_handle: tauri::AppHandle, db: Arc<Mutex<Clipboard
 }
 
 pub fn run() {
+    // --- FIX 1: Define the handler logic ---
+    // This handler will be attached to the main builder.
+    // It must be able to check *which* shortcut was pressed.
+    let shortcut_handler = ShortcutBuilder::new()
+        .with_handler(move |app, scut, event| {
+            // Re-create the shortcut struct to compare its ID
+            let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
+            
+            if scut.id() == shortcut.id() && event.state() == ShortcutState::Pressed {
+                let win = app.get_webview_window("main").expect("window not found");
+                if win.is_visible().unwrap_or(false) {
+                    let _ = win.hide();
+                } else {
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+            }
+        })
+        .build();
+
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        // --- Add the handler plugin ---
+        .plugin(shortcut_handler)
         .setup(|app| {
             // Initialize clipboard database
             let db_path = get_db_path(&app.handle());
@@ -573,27 +601,12 @@ pub fn run() {
 
             #[cfg(desktop)]
             {
+                // --- FIX 2: Register the shortcut ---
+                // The v2 register() function does NOT take a closure,
+                // as the handler is already registered above.
                 let shortcut =
                     Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
-                let handle = app.handle();
-
-                handle.plugin(
-                    ShortcutBuilder::new()
-                        .with_handler(move |app, scut, event| {
-                            if scut.id() == shortcut.id() && event.state() == ShortcutState::Pressed
-                            {
-                                let win = app.get_webview_window("main").expect("window not found");
-                                if win.is_visible().unwrap_or(false) {
-                                    let _ = win.hide();
-                                } else {
-                                    let _ = win.show();
-                                    let _ = win.set_focus();
-                                }
-                            }
-                        })
-                        .build(),
-                )?;
-
+                
                 app.global_shortcut().register(shortcut)?;
             }
             Ok(())
@@ -609,6 +622,7 @@ pub fn run() {
             get_recent_files,
             open_file,
             refresh_file_index,
+            hide_window,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri");
