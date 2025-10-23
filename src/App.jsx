@@ -14,34 +14,7 @@ import GuideEnd from "./pages/GuideEnd";
 
 function App() {
   const isFirstLaunch = useFirstLaunch();
-  // console.log("isFirstLaunch:", isFirstLaunch);
-
   
-  const [query, setQuery] = useState("");
-  const inputRef = useRef(null);
-  const [currentPage, setCurrentPage] = useState("home");
-  
-  useEffect(() => {
-    function handleKeyDown(e) {
-      if (e.key === "Escape") {
-        if (currentPage === "home") {
-          getCurrentWindow().hide();
-        } else {
-          setCurrentPage("home");
-          setQuery("");
-          inputRef.current?.focus();
-        }
-      }
-    }
-    
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [currentPage]);
-  
-  useEffect(() => {
-    inputRef.current?.focus();
-  }, []);
-
   return (
 
       <BrowserRouter>
