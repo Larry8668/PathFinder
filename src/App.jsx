@@ -1,68 +1,35 @@
 import { useEffect, useState, useRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./App.css";
-import HomeOptions from "./components/HomeOptions";
-import ClipboardPage from "./components/ClipboardPage";
-import OnlineSearchPage from "./components/OnlineSearchPage";
-import OpenFilePage from "./components/OpenFilePage";
+import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { useFirstLaunch } from "./hooks/useFirstLaunch";
+import Welcome from "./pages/WelcomePage";
+import Home from "./pages/HomePage";
+import Name from "./pages/Name";
+import ClipboardGuide from "./pages/ClipboardGuide";
+import About from "./pages/About";
+import OnlineSearchGuide from "./pages/OnlineSearchGuide";
+import OpenFileGuide from "./pages/OpenFileGuide";
+import GuideEnd from "./pages/GuideEnd";
 
 function App() {
-  const [query, setQuery] = useState("");
-  const inputRef = useRef(null);
-  const [currentPage, setCurrentPage] = useState("home");
-
-  useEffect(() => {
-    function handleKeyDown(e) {
-      if (e.key === "Escape") {
-        if (currentPage === "home") {
-          getCurrentWindow().hide();
-        } else {
-          setCurrentPage("home");
-          setQuery("");
-          inputRef.current?.focus();
-        }
-      }
-    }
-
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [currentPage]);
-
-  useEffect(() => {
-    inputRef.current?.focus();
-  }, []);
-
+  const isFirstLaunch = useFirstLaunch();
+  
   return (
-    <div className="raycast-overlay">
-      <div className="input-wrapper">
-        <input
-          ref={inputRef}
-          placeholder="Search..."
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          className="search-input"
-        />
-      </div>
-      <div className="main-container">
-        <div className="results">
-          {currentPage === "home" && (
-            <HomeOptions
-              query={query}
-              onSelect={setCurrentPage}
-              clearQuery={() => {
-                setQuery("");
-                inputRef.current?.focus();
-              }}
-            />
-          )}
-          {currentPage === "clipboard" && <ClipboardPage query={query} />}
-          {currentPage === "online-search" && (
-            <OnlineSearchPage query={query} />
-          )}
-          {currentPage === "open-app" && <OpenFilePage query={query} />}
-        </div>
-      </div>
-    </div>
+
+      <BrowserRouter>
+      <Routes>
+        <Route path="/" element={isFirstLaunch ? <Welcome/> : <Home/>}/>
+        <Route path="/home" element={<Home />} />
+        <Route path="/welcome" element={<Welcome/>} />
+        <Route path="/name" element={<Name/>} />
+        <Route path="/About" element={<About/>} />
+        <Route path="/ClipboardGuide" element={<ClipboardGuide/>} />
+        <Route path="/OnlineSearchGuide" element={<OnlineSearchGuide/>} />
+        <Route path="/OpenFileGuide" element={<OpenFileGuide/>} />
+        <Route path="/GuideEnd" element={<GuideEnd/>} />
+      </Routes>
+    </BrowserRouter>
   );
 }
 

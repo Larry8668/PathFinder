@@ -13,12 +13,16 @@
     "tauri:build:debug": "tauri build --debug"
   },
   "dependencies": {
+    "@tailwindcss/vite": "^4.1.14",
     "@tauri-apps/api": "^2.6.0",
     "@tauri-apps/plugin-global-shortcut": "^2.3.0",
     "@tauri-apps/plugin-opener": "^2.5.0",
     "fuse.js": "^7.1.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "react-hook-form": "^7.65.0",
+    "react-router-dom": "^7.9.4",
+    "tailwindcss": "^4.1.14"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
