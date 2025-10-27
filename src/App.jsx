@@ -5,11 +5,30 @@ import HomeOptions from "./components/HomeOptions";
 import ClipboardPage from "./components/ClipboardPage";
 import OnlineSearchPage from "./components/OnlineSearchPage";
 import OpenFilePage from "./components/OpenFilePage";
+import GuidePage from "./components/guidePages/GuidePage";
+
 
 function App() {
   const [query, setQuery] = useState("");
   const inputRef = useRef(null);
   const [currentPage, setCurrentPage] = useState("home");
+  const [firstLaunchChecked, setFirstLaunchChecked] = useState(false);
+
+  
+  useEffect(() => {
+
+    if(firstLaunchChecked === false){
+      localStorage.setItem("hasLaunched", "true");
+      setCurrentPage("open-guide")
+      console.log()
+    }
+    else{
+      setCurrentPage("home")
+    }
+    setFirstLaunchChecked(true)
+
+  },[])
+
 
   useEffect(() => {
     function handleKeyDown(e) {
@@ -40,7 +59,7 @@ function App() {
           placeholder="Search..."
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          className="search-input"
+          className={`search-input ${currentPage === "open-guide" ? "hidden" : "block"}`}
         />
       </div>
       <div className="main-container">
@@ -60,6 +79,7 @@ function App() {
             <OnlineSearchPage query={query} />
           )}
           {currentPage === "open-app" && <OpenFilePage query={query} />}
+          {currentPage === "open-guide" && <GuidePage query={query} />}
         </div>
       </div>
     </div>
