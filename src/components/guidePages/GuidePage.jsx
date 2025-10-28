@@ -4,31 +4,15 @@ import snapshort1 from "../../assets/snapshot1.png"
 import snapshot2 from "../../assets/snapshort2.png"
 import snapshot3 from "../../assets/snapshort3.png"
 import snapshort4 from "../../assets/snapshort4.png"
-import { Store } from '@tauri-apps/plugin-store';
 
 
 function GuidePage(){
     const [page, setPage] = useState(0)
 
-    useEffect(() => {
-
-        const createFile = async() => {
-            const store = new Store('.settings.json');
-            await store.set('firstLaunch', true);
-            await store.save();
-            
-            const firstLaunch = await store.get('firstLaunch');
-            console.log(firstLaunch)}
-
-        createFile()
-
-    },[])
-
-
 
 
     const handleClick = () => {
-        setPage(page + 1)
+        setPage(p => p + 1)
         console.log(page)
     }
 
@@ -72,7 +56,7 @@ if(page === 1){
                     defaultValue="" {...register("name")} type='text' placeholder="Type"/>
                 </form>
             </div>
-            <button type='button' onClick={handleClick} className="absolute bottom-3 right-5 flex flex-row justify-center py-1 px-3 bg-black rounded-md text-center text-white ">next</button>
+                <button type='button' onClick={handleClick} className="absolute bottom-3 right-5 flex flex-row justify-center py-1 px-3 bg-black rounded-md text-center text-white ">next</button>
         </div>
     )
 }
@@ -90,7 +74,7 @@ if(page === 2){
                 A powerful Raycast-inspired launcher application built with Tauri and React. PathFinder provides instant access to your most-used tools and information through a beautiful, keyboard-driven interface. And you can access it just my pressing 
                 </div>
             <div className="text-5xl text-center text-[#737373]">Ctrl+Shift+Space</div>
-            <button onClick={handleClick} className="absolute bottom-3 left-180 flex flex-row justify-center py-1 px-3 bg-black rounded-md text-center text-white ">next</button>
+            <button type="button" onClick={handleClick} className="absolute bottom-3 left-180 flex flex-row justify-center py-1 px-3 bg-black rounded-md text-center text-white ">next</button>
         </div>
     )
 }
