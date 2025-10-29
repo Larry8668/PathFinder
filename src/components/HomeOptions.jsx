@@ -7,6 +7,7 @@ const OPTIONS = [
   { title: "Clipboard", icon: "📋", page: "clipboard" },
   { title: "Online Search", icon: "🔍", page: "online-search" },
   { title: "Open App", icon: "📁", page: "open-app" },
+  { title: "Tutorial", icon: "🧭", page: "open-guide" },
 ];
 
 const fuse = new Fuse(OPTIONS, { keys: ["title"], threshold: 0.4 });
