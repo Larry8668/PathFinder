@@ -383,3 +383,130 @@
 .file-item {
   animation: slideIn 0.2s ease;
 }
+
+/* Screen Share Page Styles */
+.screen-share-page {
+  width: 100%;
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 2rem;
+}
+
+.screen-share-container {
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 12px;
+  padding: 2rem;
+  color: white;
+}
+
+.screen-share-container h2 {
+  margin: 0 0 1.5rem 0;
+  font-size: 1.5rem;
+}
+
+.code-section {
+  margin: 1.5rem 0;
+}
+
+.code-display {
+  font-size: 2rem;
+  font-weight: bold;
+  letter-spacing: 8px;
+  text-align: center;
+  padding: 1rem;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  margin: 0.5rem 0;
+  font-family: monospace;
+}
+
+.btn-primary,
+.btn-secondary,
+.btn-danger {
+  padding: 10px 20px;
+  font-size: 1rem;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  margin: 5px;
+  transition: all 0.2s;
+}
+
+.btn-primary {
+  background: #007AFF;
+  color: white;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: #0056CC;
+}
+
+.btn-primary:disabled {
+  background: #555;
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.btn-secondary {
+  background: rgba(255, 255, 255, 0.1);
+  color: white;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.btn-secondary:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.btn-danger {
+  background: #FF3B30;
+  color: white;
+}
+
+.btn-danger:hover {
+  background: #CC2E25;
+}
+
+.mode-section {
+  margin: 1.5rem 0;
+}
+
+.mode-section label {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 1rem;
+  cursor: pointer;
+  color: rgba(255, 255, 255, 0.8);
+}
+
+.mode-section input[type="radio"] {
+  margin-right: 0.5rem;
+  cursor: pointer;
+}
+
+.code-input {
+  padding: 10px;
+  font-size: 1.2rem;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.1);
+  color: white;
+  text-align: center;
+  letter-spacing: 4px;
+  text-transform: uppercase;
+}
+
+.code-input:focus {
+  outline: none;
+  border-color: #007AFF;
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.video-container {
+  margin-top: 1rem;
+  width: 100%;
+}
+
+.video-container video {
+  width: 100%;
+  border-radius: 8px;
+}
