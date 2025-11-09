@@ -719,10 +719,111 @@ async fn list_ffmpeg_devices() -> Result<serde_json::Value, String> {
         Ok(result)
     }
     
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        eprintln!("⚠️  Not running on macOS, returning empty device list");
-        // For non-macOS platforms, return empty lists
+        eprintln!("🪟 Running on Windows, using dshow for device detection");
+        
+        // On Windows, video is always "desktop" (gdigrab), but we can list audio devices
+        // First, add a default "Desktop" video device
+        let mut video_devices = Vec::new();
+        video_devices.push(serde_json::json!({
+            "index": 0,
+            "name": "Desktop"
+        }));
+        
+        // List audio devices using dshow
+        let mut audio_devices = Vec::new();
+        
+        // Get audio devices using dshow
+        let output = Command::new("ffmpeg")
+            .args(&["-f", "dshow", "-list_devices", "true", "-i", "dummy"])
+            .output()
+            .await;
+        
+        match output {
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                eprintln!("📄 FFmpeg dshow output ({} bytes):", stderr.len());
+                eprintln!("--- START FFmpeg Output ---");
+                for (i, line) in stderr.lines().enumerate() {
+                    if i < 50 { // Limit output
+                        eprintln!("Line {}: {}", i + 1, line);
+                    }
+                }
+                eprintln!("--- END FFmpeg Output ---");
+                
+                // Parse DirectShow audio devices
+                // Format: [dshow @ 0x...]  "Device Name" (audio)
+                let mut in_audio_section = false;
+                
+                for (line_num, line) in stderr.lines().enumerate() {
+                    // Look for audio device markers
+                    if line.contains("DirectShow audio devices") || line.contains("dshow audio devices") {
+                        eprintln!("🔊 Found audio devices section at line {}", line_num + 1);
+                        in_audio_section = true;
+                        continue;
+                    }
+                    
+                    if in_audio_section {
+                        // Look for device lines: [dshow @ 0x...]  "Device Name" (audio)
+                        // Or: [dshow @ 0x...]     "Device Name"
+                        if line.contains("[dshow @") && line.contains('"') {
+                            // Extract device name from quotes
+                            if let Some(quote_start) = line.find('"') {
+                                let after_quote = &line[quote_start + 1..];
+                                if let Some(quote_end) = after_quote.find('"') {
+                                    let device_name = after_quote[..quote_end].to_string();
+                                    
+                                    if !device_name.is_empty() && !device_name.contains("Alternative") {
+                                        // Use the index as the position in the list
+                                        let index = audio_devices.len();
+                                        eprintln!("  ✓ Found audio device: [{}] \"{}\"", index, device_name);
+                                        audio_devices.push(serde_json::json!({
+                                            "index": index,
+                                            "name": device_name
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Stop parsing if we hit video devices section
+                        if line.contains("DirectShow video devices") || line.contains("dshow video devices") {
+                            eprintln!("📹 Found video devices section, stopping audio parsing");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("⚠️  Failed to list dshow devices: {}", e);
+                // Continue with empty audio list
+            }
+        }
+        
+        eprintln!("📊 Parsing complete:");
+        eprintln!("  Video devices found: {}", video_devices.len());
+        for device in &video_devices {
+            eprintln!("    - [{}] {}", device["index"], device["name"]);
+        }
+        eprintln!("  Audio devices found: {}", audio_devices.len());
+        for device in &audio_devices {
+            eprintln!("    - [{}] {}", device["index"], device["name"]);
+        }
+        
+        let result = serde_json::json!({
+            "video": video_devices,
+            "audio": audio_devices
+        });
+        
+        eprintln!("✅ Returning device list to frontend");
+        Ok(result)
+    }
+    
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        eprintln!("⚠️  Not running on macOS or Windows, returning empty device list");
+        // For other platforms (Linux), return empty lists
         Ok(serde_json::json!({
             "video": [],
             "audio": []
@@ -1026,13 +1127,24 @@ fn get_ffmpeg_input_args(device: Option<&str>) -> Vec<String> {
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = device; // Unused on Windows
+        // On Windows, device format is "video_index:audio_index" (e.g., "0:0")
+        // Video is always desktop (gdigrab)
+        // For audio, we'll capture it separately using dshow
+        // Note: We'll need to get the audio device name from the index
+        // For now, we'll use a simple approach with gdigrab for video
+        // Audio will be added as a separate input stream
+        
         vec![
             "-f".to_string(),
             "gdigrab".to_string(),
+            "-framerate".to_string(),
+            "30".to_string(),
             "-i".to_string(),
             "desktop".to_string(),
         ]
+        // Note: Audio input will be added separately in start_ffmpeg if needed
+        // This requires getting the device name from the index, which we'll handle
+        // by querying the device list or storing device names
     }
     #[cfg(target_os = "linux")]
     {
