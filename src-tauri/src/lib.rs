@@ -574,8 +574,10 @@ struct HlsServerState {
 
 struct HlsServerHandle {
     ffmpeg_handle: Option<tokio::process::Child>,
+    ffmpeg_pid: Option<u32>, // Store PID for Windows process tree killing
     server_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
     tunnel_handle: Option<tokio::process::Child>,
+    tunnel_pid: Option<u32>, // Store PID for Windows process tree killing
     access_code: String,
     port: u16,
     tunnel_url: Option<String>,
@@ -1472,9 +1474,18 @@ async fn start_hls_server_cmd(
     
     // Start FFmpeg with device selection
     let device_str = device.as_deref();
-    let ffmpeg_handle = start_ffmpeg(&public_dir, device_str)
+    let mut ffmpeg_handle = start_ffmpeg(&public_dir, device_str)
         .await
         .map_err(|e| format!("Failed to start FFmpeg: {}", e))?;
+    
+    // Get FFmpeg PID (id() returns Option<u32> on all platforms)
+    let ffmpeg_pid = ffmpeg_handle.id();
+    
+    if let Some(pid) = ffmpeg_pid {
+        eprintln!("📹 FFmpeg started with PID: {}", pid);
+    } else {
+        eprintln!("📹 FFmpeg started (PID not available)");
+    }
     
     // Start HTTP server
     let server_state = hls_state.clone();
@@ -1483,16 +1494,22 @@ async fn start_hls_server_cmd(
     });
     
     // Start localtunnel
-    let (tunnel_handle, tunnel_url, tunnel_domain) = match start_localtunnel(port).await {
-        Ok((handle, url, domain)) => {
-            eprintln!("✅ Tunnel created: {}", url);
-            eprintln!("   Domain: {}", domain);
-            (Some(handle), Some(url), Some(domain))
+    let (tunnel_handle, tunnel_url, tunnel_domain, tunnel_pid) = match start_localtunnel(port).await {
+        Ok((mut handle, url, domain)) => {
+            // Get tunnel PID (id() returns Option<u32> on all platforms)
+            let pid = handle.id();
+            
+            if let Some(p) = pid {
+                eprintln!("🌐 Tunnel started with PID: {}", p);
+            } else {
+                eprintln!("🌐 Tunnel started (PID not available)");
+            }
+            (Some(handle), Some(url), Some(domain), pid)
         }
         Err(e) => {
             eprintln!("⚠️  Failed to create tunnel: {}", e);
             eprintln!("   Server still running on localhost - tunnel creation failed");
-            (None, None, None)
+            (None, None, None, None)
         }
     };
     
@@ -1501,8 +1518,10 @@ async fn start_hls_server_cmd(
         let mut handle_opt = state.lock().unwrap();
         *handle_opt = Some(HlsServerHandle {
             ffmpeg_handle: Some(ffmpeg_handle),
+            ffmpeg_pid,
             server_handle,
             tunnel_handle,
+            tunnel_pid,
             access_code: access_code.clone(),
             port,
             tunnel_url: tunnel_url.clone(),
@@ -1526,6 +1545,86 @@ async fn start_hls_server_cmd(
     Ok(response)
 }
 
+// Helper function to kill a process on Windows (kills process tree)
+#[cfg(target_os = "windows")]
+async fn kill_process_tree_windows(pid: u32) -> Result<(), String> {
+    use std::process::Command as StdCommand;
+    
+    // Use taskkill to kill the process and all its children
+    let output = StdCommand::new("taskkill")
+        .args(&["/F", "/T", "/PID", &pid.to_string()])
+        .output();
+    
+    match output {
+        Ok(output) => {
+            if output.status.success() {
+                eprintln!("✅ Killed process tree for PID {}", pid);
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // "The process not found" is okay - it might already be dead
+                if stderr.contains("not found") {
+                    eprintln!("ℹ️  Process {} already terminated", pid);
+                    Ok(())
+                } else {
+                    eprintln!("⚠️  taskkill warning for PID {}: {}", pid, stderr);
+                    Ok(()) // Still return Ok, process might be dead
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("⚠️  Failed to run taskkill for PID {}: {}", pid, e);
+            Err(format!("Failed to kill process: {}", e))
+        }
+    }
+}
+
+// Helper function to kill a process (cross-platform)
+async fn kill_process_forcefully(child: &mut tokio::process::Child, pid: Option<u32>) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        // On Windows, use taskkill to kill process tree
+        if let Some(pid) = pid {
+            // Try to get PID from child if not provided
+            let actual_pid = pid;
+            if let Err(e) = kill_process_tree_windows(actual_pid).await {
+                eprintln!("⚠️  Failed to kill process tree, trying direct kill: {}", e);
+                // Fallback to direct kill
+                if let Err(e) = child.kill().await {
+                    eprintln!("⚠️  Direct kill also failed: {}", e);
+                    return Err(format!("Failed to kill process: {}", e));
+                }
+            }
+        } else {
+            // No PID, try direct kill
+            if let Err(e) = child.kill().await {
+                eprintln!("⚠️  Direct kill failed: {}", e);
+                return Err(format!("Failed to kill process: {}", e));
+            }
+        }
+        
+        // Wait a bit for process to terminate
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        
+        // Try to wait for the process to exit
+        let _ = child.wait().await;
+    }
+    
+    #[cfg(not(target_os = "windows"))]
+    {
+        // On macOS/Linux, direct kill should work
+        if let Err(e) = child.kill().await {
+            eprintln!("⚠️  Failed to kill process: {}", e);
+            return Err(format!("Failed to kill process: {}", e));
+        }
+        
+        // Wait for process to terminate
+        let _ = child.wait().await;
+    }
+    
+    Ok(())
+}
+
 // Tauri command to stop HLS server
 #[tauri::command]
 async fn stop_hls_server_cmd(
@@ -1537,16 +1636,34 @@ async fn stop_hls_server_cmd(
     };
     
     if let Some(mut handle) = handle_opt {
+        eprintln!("🛑 Stopping HLS server...");
+        
         // Kill FFmpeg
         if let Some(mut ffmpeg) = handle.ffmpeg_handle.take() {
-            let _ = ffmpeg.kill().await;
+            eprintln!("  Killing FFmpeg process...");
+            let ffmpeg_pid = handle.ffmpeg_pid;
+            if let Err(e) = kill_process_forcefully(&mut ffmpeg, ffmpeg_pid).await {
+                eprintln!("⚠️  Warning: Failed to kill FFmpeg: {}", e);
+            } else {
+                eprintln!("  ✅ FFmpeg stopped");
+            }
         }
+        
         // Kill tunnel
         if let Some(mut tunnel) = handle.tunnel_handle.take() {
-            let _ = tunnel.kill().await;
+            eprintln!("  Killing tunnel process...");
+            let tunnel_pid = handle.tunnel_pid;
+            if let Err(e) = kill_process_forcefully(&mut tunnel, tunnel_pid).await {
+                eprintln!("⚠️  Warning: Failed to kill tunnel: {}", e);
+            } else {
+                eprintln!("  ✅ Tunnel stopped");
+            }
         }
+        
         // Abort server task
+        eprintln!("  Stopping HTTP server...");
         handle.server_handle.abort();
+        eprintln!("  ✅ HTTP server stopped");
         
         // Clean up HLS directory
         eprintln!("🧹 Cleaning up HLS directory on server stop...");
@@ -1554,6 +1671,7 @@ async fn stop_hls_server_cmd(
             eprintln!("⚠️  Warning: Failed to cleanup HLS directory: {}", e);
         }
         
+        eprintln!("✅ HLS server fully stopped");
         Ok(())
     } else {
         Err("HLS server is not running".to_string())
