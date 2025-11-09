@@ -9,6 +9,7 @@ export default function HlsScreenSharePage({ query }) {
   const [devices, setDevices] = useState({ video: [], audio: [] });
   const [selectedVideoDevice, setSelectedVideoDevice] = useState('2');
   const [selectedAudioDevice, setSelectedAudioDevice] = useState('0');
+  const [viewerCount, setViewerCount] = useState(0);
 
   useEffect(() => {
     // Check FFmpeg availability
@@ -109,11 +110,31 @@ export default function HlsScreenSharePage({ query }) {
           tunnelUrl: info.tunnelUrl || null,
           tunnelDomain: info.tunnelDomain || null,
         });
+        setViewerCount(info.viewers || 0);
       }
     } catch (err) {
       // Server not running, ignore
     }
   };
+
+  // Poll for viewer count when server is running
+  useEffect(() => {
+    if (!isServerRunning) {
+      setViewerCount(0);
+      return;
+    }
+
+    const interval = setInterval(async () => {
+      try {
+        const count = await invoke('get_hls_viewer_count');
+        setViewerCount(count);
+      } catch (err) {
+        // Ignore errors
+      }
+    }, 2000); // Poll every 2 seconds
+
+    return () => clearInterval(interval);
+  }, [isServerRunning]);
 
   const startServer = async () => {
     try {
@@ -134,6 +155,7 @@ export default function HlsScreenSharePage({ query }) {
       await invoke('stop_hls_server_cmd');
       setIsServerRunning(false);
       setServerInfo(null);
+      setViewerCount(0);
       console.log('HLS server stopped');
     } catch (err) {
       setError(`Failed to stop server: ${err}`);
@@ -264,6 +286,15 @@ export default function HlsScreenSharePage({ query }) {
               >
                 📋 Copy Code
               </button>
+              
+              <div style={{ marginTop: '20px', padding: '12px', backgroundColor: 'rgba(76, 175, 80, 0.2)', borderRadius: '8px', border: '1px solid rgba(76, 175, 80, 0.3)' }}>
+                <p style={{ margin: 0, fontSize: '14px', fontWeight: 'bold', color: '#4CAF50' }}>
+                  👥 Viewers: <span style={{ fontSize: '18px' }}>{viewerCount}</span>
+                </p>
+                <p style={{ margin: '5px 0 0 0', fontSize: '11px', color: 'rgba(255,255,255,0.6)' }}>
+                  {viewerCount === 0 ? 'No active viewers' : viewerCount === 1 ? '1 person watching' : `${viewerCount} people watching`}
+                </p>
+              </div>
             </div>
 
             <div className="action-section" style={{ marginTop: '30px' }}>

@@ -518,7 +518,7 @@ fn hide_window(app: tauri::AppHandle) {
 fn start_clipboard_monitor(app_handle: tauri::AppHandle, db: Arc<Mutex<ClipboardDatabase>>) {
     std::thread::spawn(move || {
         let mut last_content = String::new();
-        
+    
         loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
             
@@ -569,6 +569,7 @@ struct HlsServerState {
     access_code: String,
     port: u16,
     public_dir: PathBuf,
+    viewers: Arc<Mutex<std::collections::HashMap<String, std::time::SystemTime>>>, // IP -> last seen
 }
 
 struct HlsServerHandle {
@@ -579,6 +580,8 @@ struct HlsServerHandle {
     port: u16,
     tunnel_url: Option<String>,
     tunnel_domain: Option<String>,
+    public_dir: PathBuf,
+    viewers: Arc<Mutex<std::collections::HashMap<String, std::time::SystemTime>>>,
 }
 
 // Check if FFmpeg is available
@@ -677,17 +680,17 @@ async fn list_ffmpeg_devices() -> Result<serde_json::Value, String> {
                                                 "index": index,
                                                 "name": name
                                             }));
-                                        }
-                                    } else {
+            }
+        } else {
                                         eprintln!("  ⚠️  Line {}: Empty device name: {}", line_num + 1, line);
                                     }
-                                } else {
+        } else {
                                     eprintln!("  ⚠️  Line {}: Could not parse index '{}' from: {}", line_num + 1, index_str, line);
-                                }
-                            } else {
+            }
+        } else {
                                 eprintln!("  ⚠️  Line {}: No closing bracket for device index: {}", line_num + 1, line);
                             }
-                        } else {
+        } else {
                             eprintln!("  ⚠️  Line {}: No second bracket found: {}", line_num + 1, line);
                         }
                     }
@@ -929,8 +932,58 @@ fn get_ffmpeg_input_args(device: Option<&str>) -> Vec<String> {
     }
 }
 
+// Cleanup HLS directory - remove all .ts and .m3u8 files
+fn cleanup_hls_directory(public_dir: &PathBuf) -> Result<(), String> {
+    eprintln!("🧹 Cleaning up HLS directory: {}", public_dir.display());
+    
+    if !public_dir.exists() {
+        eprintln!("  Directory doesn't exist, skipping cleanup");
+        return Ok(());
+    }
+    
+    let mut cleaned_count = 0;
+    match fs::read_dir(public_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry) => {
+                        let path = entry.path();
+                        if path.is_file() {
+                            if let Some(ext) = path.extension() {
+                                if ext == "ts" || ext == "m3u8" {
+                                    match fs::remove_file(&path) {
+                                        Ok(_) => {
+                                            cleaned_count += 1;
+                                            eprintln!("  ✓ Removed: {}", path.file_name().unwrap_or_default().to_string_lossy());
+                                        }
+                                        Err(e) => {
+                                            eprintln!("  ⚠️  Failed to remove {}: {}", path.display(), e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  ⚠️  Error reading directory entry: {}", e);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            return Err(format!("Failed to read HLS directory: {}", e));
+        }
+    }
+    
+    eprintln!("✅ Cleanup complete: removed {} files", cleaned_count);
+    Ok(())
+}
+
 // Start FFmpeg process
 async fn start_ffmpeg(public_dir: &PathBuf, device: Option<&str>) -> anyhow::Result<tokio::process::Child> {
+    // Clean up old files first
+    cleanup_hls_directory(public_dir).map_err(|e| anyhow::anyhow!("Cleanup failed: {}", e))?;
+    
     // Ensure public directory exists
     fs::create_dir_all(public_dir)?;
     
@@ -1068,6 +1121,34 @@ async fn serve_hls_file(
 async fn start_hls_server(state: Arc<HlsServerState>) -> anyhow::Result<()> {
     use axum::routing::get;
     
+    // Helper to get client IP
+    fn get_client_ip(headers: &axum::http::HeaderMap) -> String {
+        // Try to get IP from X-Forwarded-For (for tunnel) or X-Real-IP
+        if let Some(forwarded) = headers.get("x-forwarded-for") {
+            if let Ok(forwarded_str) = forwarded.to_str() {
+                // Take the first IP if there are multiple
+                if let Some(ip) = forwarded_str.split(',').next() {
+                    return ip.trim().to_string();
+                }
+            }
+        }
+        if let Some(real_ip) = headers.get("x-real-ip") {
+            if let Ok(ip_str) = real_ip.to_str() {
+                return ip_str.to_string();
+            }
+        }
+        // Fallback to "unknown"
+        "unknown".to_string()
+    }
+    
+    // Helper to track viewer
+    fn track_viewer(state: &Arc<HlsServerState>, ip: String) {
+        let mut viewers = state.viewers.lock().unwrap();
+        viewers.insert(ip, SystemTime::now());
+        let count = viewers.len();
+        eprintln!("👥 Viewer tracked. Total viewers: {}", count);
+    }
+    
     // Handler for stream.m3u8 (no path param)
     async fn serve_stream_m3u8(
         State(state): State<Arc<HlsServerState>>,
@@ -1087,6 +1168,10 @@ async fn start_hls_server(state: Arc<HlsServerState>) -> anyhow::Result<()> {
         } else {
             return Err(StatusCode::FORBIDDEN);
         }
+        
+        // Track viewer
+        let client_ip = get_client_ip(&headers);
+        track_viewer(&state, client_ip);
         
         let file_path = state.public_dir.join("stream.m3u8");
         if file_path.exists() {
@@ -1132,6 +1217,10 @@ async fn start_hls_server(state: Arc<HlsServerState>) -> anyhow::Result<()> {
             return Err(StatusCode::FORBIDDEN);
         }
         
+        // Track viewer (update timestamp to keep them active)
+        let client_ip = get_client_ip(&headers);
+        track_viewer(&state, client_ip);
+        
         let file_path = state.public_dir.join(path);
         eprintln!("📁 Looking for file: {}", file_path.display());
         
@@ -1163,6 +1252,29 @@ async fn start_hls_server(state: Arc<HlsServerState>) -> anyhow::Result<()> {
     }
     
     use axum::routing::any;
+    
+    // Spawn cleanup task to remove stale viewers (older than 30 seconds)
+    let cleanup_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            let mut viewers = cleanup_state.viewers.lock().unwrap();
+            let now = SystemTime::now();
+            let before_count = viewers.len();
+            viewers.retain(|_ip, last_seen| {
+                if let Ok(duration) = now.duration_since(*last_seen) {
+                    duration.as_secs() < 30 // Keep viewers active for 30 seconds
+                } else {
+                    false
+                }
+            });
+            let after_count = viewers.len();
+            if before_count != after_count {
+                eprintln!("🧹 Cleaned up {} stale viewers. Active: {}", before_count - after_count, after_count);
+            }
+        }
+    });
     
     let app = Router::new()
         .route("/api/info", get(hls_api_info))
@@ -1210,6 +1322,7 @@ async fn start_hls_server_cmd(
         access_code: access_code.clone(),
         port,
         public_dir: public_dir.clone(),
+        viewers: Arc::new(Mutex::new(std::collections::HashMap::new())),
     });
     
     // Start FFmpeg with device selection
@@ -1249,6 +1362,8 @@ async fn start_hls_server_cmd(
             port,
             tunnel_url: tunnel_url.clone(),
             tunnel_domain: tunnel_domain.clone(),
+            public_dir: public_dir.clone(),
+            viewers: hls_state.viewers.clone(),
         });
     }
     
@@ -1287,6 +1402,13 @@ async fn stop_hls_server_cmd(
         }
         // Abort server task
         handle.server_handle.abort();
+        
+        // Clean up HLS directory
+        eprintln!("🧹 Cleaning up HLS directory on server stop...");
+        if let Err(e) = cleanup_hls_directory(&handle.public_dir) {
+            eprintln!("⚠️  Warning: Failed to cleanup HLS directory: {}", e);
+        }
+        
         Ok(())
     } else {
         Err("HLS server is not running".to_string())
@@ -1300,11 +1422,18 @@ async fn get_hls_server_info(
 ) -> Result<Option<serde_json::Value>, String> {
     let handle_opt = state.lock().unwrap();
     if let Some(handle) = handle_opt.as_ref() {
+        // Get viewer count
+        let viewer_count = {
+            let viewers = handle.viewers.lock().unwrap();
+            viewers.len()
+        };
+        
         let mut info = serde_json::json!({
             "running": true,
             "code": handle.access_code,
             "port": handle.port,
             "url": format!("http://localhost:{}", handle.port),
+            "viewers": viewer_count,
         });
         
         if let Some(ref tunnel_url) = handle.tunnel_url {
@@ -1317,6 +1446,20 @@ async fn get_hls_server_info(
         Ok(Some(info))
     } else {
         Ok(None)
+    }
+}
+
+// Tauri command to get viewer count
+#[tauri::command]
+async fn get_hls_viewer_count(
+    state: tauri::State<'_, Arc<Mutex<Option<HlsServerHandle>>>>,
+) -> Result<usize, String> {
+    let handle_opt = state.lock().unwrap();
+    if let Some(handle) = handle_opt.as_ref() {
+        let viewers = handle.viewers.lock().unwrap();
+        Ok(viewers.len())
+    } else {
+        Ok(0)
     }
 }
 
@@ -1403,6 +1546,7 @@ pub fn run() {
             start_hls_server_cmd,
             stop_hls_server_cmd,
             get_hls_server_info,
+            get_hls_viewer_count,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri");
