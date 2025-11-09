@@ -721,7 +721,7 @@ async fn list_ffmpeg_devices() -> Result<serde_json::Value, String> {
     
     #[cfg(target_os = "windows")]
     {
-        eprintln!("🪟 Running on Windows, using dshow for device detection");
+        eprintln!("🪟 Running on Windows, detecting audio devices");
         
         // On Windows, video is always "desktop" (gdigrab), but we can list audio devices
         // First, add a default "Desktop" video device
@@ -731,74 +731,102 @@ async fn list_ffmpeg_devices() -> Result<serde_json::Value, String> {
             "name": "Desktop"
         }));
         
-        // List audio devices using dshow
         let mut audio_devices = Vec::new();
+        let mut wasapi_available = false;
         
-        // Get audio devices using dshow
-        let output = Command::new("ffmpeg")
-            .args(&["-f", "dshow", "-list_devices", "true", "-i", "dummy"])
+        // Try wasapi first (if FFmpeg supports it)
+        let wasapi_output = Command::new("ffmpeg")
+            .args(&["-f", "wasapi", "-list_devices", "true", "-i", "dummy"])
             .output()
             .await;
         
-        match output {
+        match wasapi_output {
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                eprintln!("📄 FFmpeg dshow output ({} bytes):", stderr.len());
-                eprintln!("--- START FFmpeg Output ---");
-                for (i, line) in stderr.lines().enumerate() {
-                    if i < 50 { // Limit output
-                        eprintln!("Line {}: {}", i + 1, line);
-                    }
-                }
-                eprintln!("--- END FFmpeg Output ---");
                 
-                // Parse DirectShow audio devices
-                // Format: [dshow @ 0x...]  "Device Name" (audio)
-                let mut in_audio_section = false;
-                
-                for (line_num, line) in stderr.lines().enumerate() {
-                    // Look for audio device markers
-                    if line.contains("DirectShow audio devices") || line.contains("dshow audio devices") {
-                        eprintln!("🔊 Found audio devices section at line {}", line_num + 1);
-                        in_audio_section = true;
-                        continue;
-                    }
+                // Check if wasapi is actually supported (not "Unknown input format")
+                if !stderr.contains("Unknown input format") && !stderr.contains("Invalid argument") {
+                    wasapi_available = true;
+                    eprintln!("✅ wasapi is available, using it for device detection");
+                    eprintln!("📄 FFmpeg wasapi output ({} bytes):", stderr.len());
                     
-                    if in_audio_section {
-                        // Look for device lines: [dshow @ 0x...]  "Device Name" (audio)
-                        // Or: [dshow @ 0x...]     "Device Name"
-                        if line.contains("[dshow @") && line.contains('"') {
-                            // Extract device name from quotes
+                    // Parse WASAPI audio devices
+                    let mut device_index = 0;
+                    for line in stderr.lines() {
+                        if line.contains("[wasapi @") && line.contains('"') {
                             if let Some(quote_start) = line.find('"') {
                                 let after_quote = &line[quote_start + 1..];
                                 if let Some(quote_end) = after_quote.find('"') {
                                     let device_name = after_quote[..quote_end].to_string();
-                                    
-                                    if !device_name.is_empty() && !device_name.contains("Alternative") {
-                                        // Use the index as the position in the list
-                                        let index = audio_devices.len();
-                                        eprintln!("  ✓ Found audio device: [{}] \"{}\"", index, device_name);
+                                    if !device_name.is_empty() {
+                                        eprintln!("  ✓ Found wasapi audio device: [{}] \"{}\"", device_index, device_name);
                                         audio_devices.push(serde_json::json!({
-                                            "index": index,
+                                            "index": device_index,
                                             "name": device_name
                                         }));
+                                        device_index += 1;
                                     }
                                 }
                             }
                         }
-                        
-                        // Stop parsing if we hit video devices section
-                        if line.contains("DirectShow video devices") || line.contains("dshow video devices") {
-                            eprintln!("📹 Found video devices section, stopping audio parsing");
-                            break;
+                    }
+                } else {
+                    eprintln!("⚠️  wasapi not supported in this FFmpeg build");
+                }
+            }
+            Err(e) => {
+                eprintln!("⚠️  Failed to query wasapi: {}", e);
+            }
+        }
+        
+        // If wasapi didn't work or found no devices, try dshow
+        if !wasapi_available || audio_devices.is_empty() {
+            eprintln!("🔄 Trying dshow as fallback...");
+            let dshow_output = Command::new("ffmpeg")
+                .args(&["-f", "dshow", "-list_devices", "true", "-i", "dummy"])
+                .output()
+                .await;
+            
+            if let Ok(dshow_output) = dshow_output {
+                let stderr = String::from_utf8_lossy(&dshow_output.stderr);
+                eprintln!("📄 FFmpeg dshow output ({} bytes):", stderr.len());
+                
+                // If we already have devices from wasapi, don't overwrite
+                if audio_devices.is_empty() {
+                    let mut device_index = 0;
+                    
+                    // Parse dshow devices - look for any device with quotes
+                    for line in stderr.lines() {
+                        if line.contains("[dshow @") && line.contains('"') && !line.contains("Alternative") {
+                            if let Some(quote_start) = line.find('"') {
+                                let after_quote = &line[quote_start + 1..];
+                                if let Some(quote_end) = after_quote.find('"') {
+                                    let device_name = after_quote[..quote_end].to_string();
+                                    if !device_name.is_empty() && !device_name.contains("USB") && !device_name.contains("UVC") {
+                                        // Skip video devices (webcams), only capture audio devices
+                                        // This is a heuristic - dshow doesn't clearly separate audio/video
+                                        eprintln!("  ✓ Found dshow device: [{}] \"{}\"", device_index, device_name);
+                                        audio_devices.push(serde_json::json!({
+                                            "index": device_index,
+                                            "name": device_name
+                                        }));
+                                        device_index += 1;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
-            Err(e) => {
-                eprintln!("⚠️  Failed to list dshow devices: {}", e);
-                // Continue with empty audio list
-            }
+        }
+        
+        // If still no devices found, add a default option
+        if audio_devices.is_empty() {
+            eprintln!("⚠️  No audio devices found, adding default option");
+            audio_devices.push(serde_json::json!({
+                "index": 0,
+                "name": "Default Audio Device"
+            }));
         }
         
         eprintln!("📊 Parsing complete:");
@@ -1109,6 +1137,80 @@ fn generate_access_code() -> String {
         .collect()
 }
 
+// Helper function to get Windows audio device name from index
+#[cfg(target_os = "windows")]
+async fn get_windows_audio_device_name(audio_index: usize) -> Option<String> {
+    // Try wasapi first (if supported)
+    let wasapi_output = Command::new("ffmpeg")
+        .args(&["-f", "wasapi", "-list_devices", "true", "-i", "dummy"])
+        .output()
+        .await;
+    
+    let mut wasapi_available = false;
+    if let Ok(output) = wasapi_output {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("Unknown input format") && !stderr.contains("Invalid argument") {
+            wasapi_available = true;
+            let mut audio_devices = Vec::new();
+            
+            for line in stderr.lines() {
+                if line.contains("[wasapi @") && line.contains('"') {
+                    if let Some(quote_start) = line.find('"') {
+                        let after_quote = &line[quote_start + 1..];
+                        if let Some(quote_end) = after_quote.find('"') {
+                            let device_name = after_quote[..quote_end].to_string();
+                            if !device_name.is_empty() {
+                                audio_devices.push(device_name);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if let Some(device_name) = audio_devices.get(audio_index) {
+                return Some(device_name.clone());
+            }
+        }
+    }
+    
+    // Fallback to dshow
+    let dshow_output = Command::new("ffmpeg")
+        .args(&["-f", "dshow", "-list_devices", "true", "-i", "dummy"])
+        .output()
+        .await;
+    
+    match dshow_output {
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let mut audio_devices = Vec::new();
+            
+            for line in stderr.lines() {
+                if line.contains("[dshow @") && line.contains('"') && !line.contains("Alternative") {
+                    if let Some(quote_start) = line.find('"') {
+                        let after_quote = &line[quote_start + 1..];
+                        if let Some(quote_end) = after_quote.find('"') {
+                            let device_name = after_quote[..quote_end].to_string();
+                            if !device_name.is_empty() && !device_name.contains("USB") && !device_name.contains("UVC") {
+                                audio_devices.push(device_name);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            audio_devices.get(audio_index).cloned()
+        }
+        Err(_) => {
+            // If all else fails, return default
+            if audio_index == 0 {
+                Some("default".to_string())
+            } else {
+                None
+            }
+        }
+    }
+}
+
 // Get platform-specific FFmpeg input arguments
 fn get_ffmpeg_input_args(device: Option<&str>) -> Vec<String> {
     #[cfg(target_os = "macos")]
@@ -1129,11 +1231,7 @@ fn get_ffmpeg_input_args(device: Option<&str>) -> Vec<String> {
     {
         // On Windows, device format is "video_index:audio_index" (e.g., "0:0")
         // Video is always desktop (gdigrab)
-        // For audio, we'll capture it separately using dshow
-        // Note: We'll need to get the audio device name from the index
-        // For now, we'll use a simple approach with gdigrab for video
-        // Audio will be added as a separate input stream
-        
+        // Audio will be added separately in start_ffmpeg
         vec![
             "-f".to_string(),
             "gdigrab".to_string(),
@@ -1142,9 +1240,6 @@ fn get_ffmpeg_input_args(device: Option<&str>) -> Vec<String> {
             "-i".to_string(),
             "desktop".to_string(),
         ]
-        // Note: Audio input will be added separately in start_ffmpeg if needed
-        // This requires getting the device name from the index, which we'll handle
-        // by querying the device list or storing device names
     }
     #[cfg(target_os = "linux")]
     {
@@ -1231,8 +1326,84 @@ async fn start_ffmpeg(public_dir: &PathBuf, device: Option<&str>) -> anyhow::Res
         "50M".to_string(),
     ];
     
-    // Add platform-specific input
-    args.extend(get_ffmpeg_input_args(device));
+    #[cfg(target_os = "windows")]
+    {
+        // On Windows, we need separate inputs for video (gdigrab) and audio (dshow)
+        // Parse device string: "video_index:audio_index"
+        let audio_index = device
+            .and_then(|d| d.split(':').nth(1))
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        
+        // Add video input (gdigrab)
+        args.extend(get_ffmpeg_input_args(device));
+        
+        // Get audio device name and add audio input
+        // Try wasapi first (if supported), fallback to dshow
+        if let Some(audio_device_name) = get_windows_audio_device_name(audio_index).await {
+            eprintln!("🔊 Using audio device: \"{}\" (index: {})", audio_device_name, audio_index);
+            
+            // Check if wasapi is actually supported
+            let wasapi_test = Command::new("ffmpeg")
+                .args(&["-f", "wasapi", "-list_devices", "true", "-i", "dummy"])
+                .output()
+                .await;
+            
+            let use_wasapi = wasapi_test.is_ok() && 
+                !String::from_utf8_lossy(&wasapi_test.as_ref().unwrap().stderr)
+                    .contains("Unknown input format");
+            
+            if use_wasapi {
+                // Use wasapi (Windows Audio Session API)
+                args.extend(vec![
+                    "-f".to_string(),
+                    "wasapi".to_string(),
+                    "-i".to_string(),
+                    format!("{}", audio_device_name), // wasapi uses device name directly
+                ]);
+            } else {
+                // Fallback to dshow
+                if audio_device_name == "default" || audio_device_name == "Default Audio Device" {
+                    args.extend(vec![
+                        "-f".to_string(),
+                        "dshow".to_string(),
+                        "-i".to_string(),
+                        "audio=default".to_string(),
+                    ]);
+                } else {
+                    args.extend(vec![
+                        "-f".to_string(),
+                        "dshow".to_string(),
+                        "-i".to_string(),
+                        format!("audio=\"{}\"", audio_device_name),
+                    ]);
+                }
+            }
+        } else {
+            eprintln!("⚠️  Could not find audio device at index {}, using default", audio_index);
+            // Use dshow default (wasapi likely not available)
+            args.extend(vec![
+                "-f".to_string(),
+                "dshow".to_string(),
+                "-i".to_string(),
+                "audio=default".to_string(),
+            ]);
+        }
+        
+        // Add stream mapping for Windows (map video from input 0, audio from input 1)
+        args.extend(vec![
+            "-map".to_string(),
+            "0:v".to_string(), // Video from first input (gdigrab)
+            "-map".to_string(),
+            "1:a".to_string(), // Audio from second input (dshow)
+        ]);
+    }
+    
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Add platform-specific input (macOS/Linux use single input)
+        args.extend(get_ffmpeg_input_args(device));
+    }
     
     // Add encoding and output args
     args.extend(vec![
@@ -1270,6 +1441,8 @@ async fn start_ffmpeg(public_dir: &PathBuf, device: Option<&str>) -> anyhow::Res
         format!("{}/segment_%03d.ts", public_dir.display()),
         format!("{}/stream.m3u8", public_dir.display()),
     ]);
+    
+    eprintln!("🎬 FFmpeg command: ffmpeg {}", args.join(" "));
     
     let mut cmd = Command::new("ffmpeg");
     cmd.args(&args);
