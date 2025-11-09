@@ -574,8 +574,10 @@ struct HlsServerState {
 
 struct HlsServerHandle {
     ffmpeg_handle: Option<tokio::process::Child>,
+    ffmpeg_pid: Option<u32>, // Store PID for Windows process tree killing
     server_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
     tunnel_handle: Option<tokio::process::Child>,
+    tunnel_pid: Option<u32>, // Store PID for Windows process tree killing
     access_code: String,
     port: u16,
     tunnel_url: Option<String>,
@@ -717,10 +719,139 @@ async fn list_ffmpeg_devices() -> Result<serde_json::Value, String> {
         Ok(result)
     }
     
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        eprintln!("⚠️  Not running on macOS, returning empty device list");
-        // For non-macOS platforms, return empty lists
+        eprintln!("🪟 Running on Windows, detecting audio devices");
+        
+        // On Windows, video is always "desktop" (gdigrab), but we can list audio devices
+        // First, add a default "Desktop" video device
+        let mut video_devices = Vec::new();
+        video_devices.push(serde_json::json!({
+            "index": 0,
+            "name": "Desktop"
+        }));
+        
+        let mut audio_devices = Vec::new();
+        let mut wasapi_available = false;
+        
+        // Try wasapi first (if FFmpeg supports it)
+        let wasapi_output = Command::new("ffmpeg")
+            .args(&["-f", "wasapi", "-list_devices", "true", "-i", "dummy"])
+            .output()
+            .await;
+        
+        match wasapi_output {
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                
+                // Check if wasapi is actually supported (not "Unknown input format")
+                if !stderr.contains("Unknown input format") && !stderr.contains("Invalid argument") {
+                    wasapi_available = true;
+                    eprintln!("✅ wasapi is available, using it for device detection");
+                    eprintln!("📄 FFmpeg wasapi output ({} bytes):", stderr.len());
+                    
+                    // Parse WASAPI audio devices
+                    let mut device_index = 0;
+                    for line in stderr.lines() {
+                        if line.contains("[wasapi @") && line.contains('"') {
+                            if let Some(quote_start) = line.find('"') {
+                                let after_quote = &line[quote_start + 1..];
+                                if let Some(quote_end) = after_quote.find('"') {
+                                    let device_name = after_quote[..quote_end].to_string();
+                                    if !device_name.is_empty() {
+                                        eprintln!("  ✓ Found wasapi audio device: [{}] \"{}\"", device_index, device_name);
+                                        audio_devices.push(serde_json::json!({
+                                            "index": device_index,
+                                            "name": device_name
+                                        }));
+                                        device_index += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    eprintln!("⚠️  wasapi not supported in this FFmpeg build");
+                }
+            }
+            Err(e) => {
+                eprintln!("⚠️  Failed to query wasapi: {}", e);
+            }
+        }
+        
+        // If wasapi didn't work or found no devices, try dshow
+        if !wasapi_available || audio_devices.is_empty() {
+            eprintln!("🔄 Trying dshow as fallback...");
+            let dshow_output = Command::new("ffmpeg")
+                .args(&["-f", "dshow", "-list_devices", "true", "-i", "dummy"])
+                .output()
+                .await;
+            
+            if let Ok(dshow_output) = dshow_output {
+                let stderr = String::from_utf8_lossy(&dshow_output.stderr);
+                eprintln!("📄 FFmpeg dshow output ({} bytes):", stderr.len());
+                
+                // If we already have devices from wasapi, don't overwrite
+                if audio_devices.is_empty() {
+                    let mut device_index = 0;
+                    
+                    // Parse dshow devices - look for any device with quotes
+                    for line in stderr.lines() {
+                        if line.contains("[dshow @") && line.contains('"') && !line.contains("Alternative") {
+                            if let Some(quote_start) = line.find('"') {
+                                let after_quote = &line[quote_start + 1..];
+                                if let Some(quote_end) = after_quote.find('"') {
+                                    let device_name = after_quote[..quote_end].to_string();
+                                    if !device_name.is_empty() && !device_name.contains("USB") && !device_name.contains("UVC") {
+                                        // Skip video devices (webcams), only capture audio devices
+                                        // This is a heuristic - dshow doesn't clearly separate audio/video
+                                        eprintln!("  ✓ Found dshow device: [{}] \"{}\"", device_index, device_name);
+                                        audio_devices.push(serde_json::json!({
+                                            "index": device_index,
+                                            "name": device_name
+                                        }));
+                                        device_index += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // If still no devices found, add a default option
+        if audio_devices.is_empty() {
+            eprintln!("⚠️  No audio devices found, adding default option");
+            audio_devices.push(serde_json::json!({
+                "index": 0,
+                "name": "Default Audio Device"
+            }));
+        }
+        
+        eprintln!("📊 Parsing complete:");
+        eprintln!("  Video devices found: {}", video_devices.len());
+        for device in &video_devices {
+            eprintln!("    - [{}] {}", device["index"], device["name"]);
+        }
+        eprintln!("  Audio devices found: {}", audio_devices.len());
+        for device in &audio_devices {
+            eprintln!("    - [{}] {}", device["index"], device["name"]);
+        }
+        
+        let result = serde_json::json!({
+            "video": video_devices,
+            "audio": audio_devices
+        });
+        
+        eprintln!("✅ Returning device list to frontend");
+        Ok(result)
+    }
+    
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        eprintln!("⚠️  Not running on macOS or Windows, returning empty device list");
+        // For other platforms (Linux), return empty lists
         Ok(serde_json::json!({
             "video": [],
             "audio": []
@@ -731,29 +862,148 @@ async fn list_ffmpeg_devices() -> Result<serde_json::Value, String> {
 // Check if localtunnel is available (via npx)
 #[tauri::command]
 async fn check_localtunnel() -> Result<bool, String> {
-    // Check if npx is available
-    let npx_check = Command::new("npx")
-        .arg("--version")
-        .output()
-        .await;
-    
-    if npx_check.is_err() {
+    // On Windows, try cmd.exe /c npx first, then direct npx
+    #[cfg(target_os = "windows")]
+    {
+        // Try cmd.exe /c npx (Windows command prompt)
+        let npx_check = Command::new("cmd")
+            .args(&["/C", "npx", "--version"])
+            .output()
+            .await;
+        
+        if npx_check.is_ok() && npx_check.as_ref().unwrap().status.success() {
+            return Ok(true);
+        }
+        
+        // Fallback: try direct npx (might work if Node.js is in PATH)
+        let npx_direct = Command::new("npx")
+            .arg("--version")
+            .output()
+            .await;
+        
+        if npx_direct.is_ok() && npx_direct.as_ref().unwrap().status.success() {
+            return Ok(true);
+        }
+        
+        // Check if Node.js is installed by checking common locations
+        let node_check = Command::new("cmd")
+            .args(&["/C", "node", "--version"])
+            .output()
+            .await;
+        
+        if node_check.is_ok() && node_check.as_ref().unwrap().status.success() {
+            // Node.js exists but npx might not be in PATH
+            // This is still considered "available" as npx comes with npm
+            return Ok(true);
+        }
+        
         return Ok(false);
     }
     
-    // Try to run localtunnel --help (this will download it if needed, but we just check if it works)
-    // Actually, we'll just check if npx works - localtunnel will be downloaded on first use
-    Ok(true)
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Check if npx is available (macOS/Linux)
+        let npx_check = Command::new("npx")
+            .arg("--version")
+            .output()
+            .await;
+        
+        if npx_check.is_err() {
+            return Ok(false);
+        }
+        
+        Ok(true)
+    }
 }
 
 // Start localtunnel and parse the URL
 async fn start_localtunnel(port: u16) -> anyhow::Result<(tokio::process::Child, String, String)> {
-    let mut cmd = Command::new("npx");
-    cmd.args(&["-y", "localtunnel", "--port", &port.to_string()]);
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    {
+        // On Windows, try multiple methods to run npx
+        // Method 1: Try cmd.exe /C npx (works if npx is in PATH)
+        let mut cmd = Command::new("cmd");
+        cmd.args(&["/C", "npx", "-y", "localtunnel", "--port", &port.to_string()]);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.stdin(Stdio::null()); // Prevent cmd from waiting for input
+        
+        match cmd.spawn() {
+            Ok(child) => {
+                eprintln!("✅ Started localtunnel via cmd.exe /C npx");
+                return start_localtunnel_common(child, port).await;
+            }
+            Err(e1) => {
+                eprintln!("⚠️  Failed to start localtunnel via cmd.exe /C npx: {}", e1);
+                
+                // Method 2: Try npx.cmd directly (Windows-specific)
+                let mut cmd2 = Command::new("npx.cmd");
+                cmd2.args(&["-y", "localtunnel", "--port", &port.to_string()]);
+                cmd2.stdout(Stdio::piped());
+                cmd2.stderr(Stdio::piped());
+                
+                match cmd2.spawn() {
+                    Ok(child) => {
+                        eprintln!("✅ Started localtunnel via npx.cmd");
+                        return start_localtunnel_common(child, port).await;
+                    }
+                    Err(e2) => {
+                        eprintln!("⚠️  Failed to start localtunnel via npx.cmd: {}", e2);
+                        
+                        // Method 3: Try npx directly (might work if Node.js is in PATH)
+                        let mut cmd3 = Command::new("npx");
+                        cmd3.args(&["-y", "localtunnel", "--port", &port.to_string()]);
+                        cmd3.stdout(Stdio::piped());
+                        cmd3.stderr(Stdio::piped());
+                        
+                        match cmd3.spawn() {
+                            Ok(child) => {
+                                eprintln!("✅ Started localtunnel via npx directly");
+                                return start_localtunnel_common(child, port).await;
+                            }
+                            Err(e3) => {
+                                eprintln!("⚠️  Failed to start localtunnel via npx directly: {}", e3);
+                                return Err(anyhow::anyhow!(
+                                    "Failed to start localtunnel. Tried multiple methods:\n\
+                                    1. cmd.exe /C npx: {}\n\
+                                    2. npx.cmd: {}\n\
+                                    3. npx: {}\n\n\
+                                    Make sure Node.js and npm are installed and in your PATH.\n\
+                                    On Windows, install Node.js from https://nodejs.org/ and restart your terminal/application.",
+                                    e1, e2, e3
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     
-    let mut child = cmd.spawn()?;
+    #[cfg(not(target_os = "windows"))]
+    {
+        // On macOS/Linux, use npx directly
+        let mut cmd = Command::new("npx");
+        cmd.args(&["-y", "localtunnel", "--port", &port.to_string()]);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        
+        let child = cmd.spawn().map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to start localtunnel: {}. Make sure Node.js and npm are installed and in your PATH.",
+                e
+            )
+        })?;
+        
+        return start_localtunnel_common(child, port).await;
+    }
+}
+
+// Common logic for parsing localtunnel output (shared between platforms)
+async fn start_localtunnel_common(
+    mut child: tokio::process::Child,
+    _port: u16,
+) -> anyhow::Result<(tokio::process::Child, String, String)> {
     
     // Wait a bit for localtunnel to start and output the URL
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
@@ -887,6 +1137,80 @@ fn generate_access_code() -> String {
         .collect()
 }
 
+// Helper function to get Windows audio device name from index
+#[cfg(target_os = "windows")]
+async fn get_windows_audio_device_name(audio_index: usize) -> Option<String> {
+    // Try wasapi first (if supported)
+    let wasapi_output = Command::new("ffmpeg")
+        .args(&["-f", "wasapi", "-list_devices", "true", "-i", "dummy"])
+        .output()
+        .await;
+    
+    let mut wasapi_available = false;
+    if let Ok(output) = wasapi_output {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("Unknown input format") && !stderr.contains("Invalid argument") {
+            wasapi_available = true;
+            let mut audio_devices = Vec::new();
+            
+            for line in stderr.lines() {
+                if line.contains("[wasapi @") && line.contains('"') {
+                    if let Some(quote_start) = line.find('"') {
+                        let after_quote = &line[quote_start + 1..];
+                        if let Some(quote_end) = after_quote.find('"') {
+                            let device_name = after_quote[..quote_end].to_string();
+                            if !device_name.is_empty() {
+                                audio_devices.push(device_name);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if let Some(device_name) = audio_devices.get(audio_index) {
+                return Some(device_name.clone());
+            }
+        }
+    }
+    
+    // Fallback to dshow
+    let dshow_output = Command::new("ffmpeg")
+        .args(&["-f", "dshow", "-list_devices", "true", "-i", "dummy"])
+        .output()
+        .await;
+    
+    match dshow_output {
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let mut audio_devices = Vec::new();
+            
+            for line in stderr.lines() {
+                if line.contains("[dshow @") && line.contains('"') && !line.contains("Alternative") {
+                    if let Some(quote_start) = line.find('"') {
+                        let after_quote = &line[quote_start + 1..];
+                        if let Some(quote_end) = after_quote.find('"') {
+                            let device_name = after_quote[..quote_end].to_string();
+                            if !device_name.is_empty() && !device_name.contains("USB") && !device_name.contains("UVC") {
+                                audio_devices.push(device_name);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            audio_devices.get(audio_index).cloned()
+        }
+        Err(_) => {
+            // If all else fails, return default
+            if audio_index == 0 {
+                Some("default".to_string())
+            } else {
+                None
+            }
+        }
+    }
+}
+
 // Get platform-specific FFmpeg input arguments
 fn get_ffmpeg_input_args(device: Option<&str>) -> Vec<String> {
     #[cfg(target_os = "macos")]
@@ -905,10 +1229,14 @@ fn get_ffmpeg_input_args(device: Option<&str>) -> Vec<String> {
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = device; // Unused on Windows
+        // On Windows, device format is "video_index:audio_index" (e.g., "0:0")
+        // Video is always desktop (gdigrab)
+        // Audio will be added separately in start_ffmpeg
         vec![
             "-f".to_string(),
             "gdigrab".to_string(),
+            "-framerate".to_string(),
+            "30".to_string(),
             "-i".to_string(),
             "desktop".to_string(),
         ]
@@ -998,8 +1326,84 @@ async fn start_ffmpeg(public_dir: &PathBuf, device: Option<&str>) -> anyhow::Res
         "50M".to_string(),
     ];
     
-    // Add platform-specific input
-    args.extend(get_ffmpeg_input_args(device));
+    #[cfg(target_os = "windows")]
+    {
+        // On Windows, we need separate inputs for video (gdigrab) and audio (dshow)
+        // Parse device string: "video_index:audio_index"
+        let audio_index = device
+            .and_then(|d| d.split(':').nth(1))
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        
+        // Add video input (gdigrab)
+        args.extend(get_ffmpeg_input_args(device));
+        
+        // Get audio device name and add audio input
+        // Try wasapi first (if supported), fallback to dshow
+        if let Some(audio_device_name) = get_windows_audio_device_name(audio_index).await {
+            eprintln!("🔊 Using audio device: \"{}\" (index: {})", audio_device_name, audio_index);
+            
+            // Check if wasapi is actually supported
+            let wasapi_test = Command::new("ffmpeg")
+                .args(&["-f", "wasapi", "-list_devices", "true", "-i", "dummy"])
+                .output()
+                .await;
+            
+            let use_wasapi = wasapi_test.is_ok() && 
+                !String::from_utf8_lossy(&wasapi_test.as_ref().unwrap().stderr)
+                    .contains("Unknown input format");
+            
+            if use_wasapi {
+                // Use wasapi (Windows Audio Session API)
+                args.extend(vec![
+                    "-f".to_string(),
+                    "wasapi".to_string(),
+                    "-i".to_string(),
+                    format!("{}", audio_device_name), // wasapi uses device name directly
+                ]);
+            } else {
+                // Fallback to dshow
+                if audio_device_name == "default" || audio_device_name == "Default Audio Device" {
+                    args.extend(vec![
+                        "-f".to_string(),
+                        "dshow".to_string(),
+                        "-i".to_string(),
+                        "audio=default".to_string(),
+                    ]);
+                } else {
+                    args.extend(vec![
+                        "-f".to_string(),
+                        "dshow".to_string(),
+                        "-i".to_string(),
+                        format!("audio=\"{}\"", audio_device_name),
+                    ]);
+                }
+            }
+        } else {
+            eprintln!("⚠️  Could not find audio device at index {}, using default", audio_index);
+            // Use dshow default (wasapi likely not available)
+            args.extend(vec![
+                "-f".to_string(),
+                "dshow".to_string(),
+                "-i".to_string(),
+                "audio=default".to_string(),
+            ]);
+        }
+        
+        // Add stream mapping for Windows (map video from input 0, audio from input 1)
+        args.extend(vec![
+            "-map".to_string(),
+            "0:v".to_string(), // Video from first input (gdigrab)
+            "-map".to_string(),
+            "1:a".to_string(), // Audio from second input (dshow)
+        ]);
+    }
+    
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Add platform-specific input (macOS/Linux use single input)
+        args.extend(get_ffmpeg_input_args(device));
+    }
     
     // Add encoding and output args
     args.extend(vec![
@@ -1037,6 +1441,8 @@ async fn start_ffmpeg(public_dir: &PathBuf, device: Option<&str>) -> anyhow::Res
         format!("{}/segment_%03d.ts", public_dir.display()),
         format!("{}/stream.m3u8", public_dir.display()),
     ]);
+    
+    eprintln!("🎬 FFmpeg command: ffmpeg {}", args.join(" "));
     
     let mut cmd = Command::new("ffmpeg");
     cmd.args(&args);
@@ -1353,9 +1759,18 @@ async fn start_hls_server_cmd(
     
     // Start FFmpeg with device selection
     let device_str = device.as_deref();
-    let ffmpeg_handle = start_ffmpeg(&public_dir, device_str)
+    let mut ffmpeg_handle = start_ffmpeg(&public_dir, device_str)
         .await
         .map_err(|e| format!("Failed to start FFmpeg: {}", e))?;
+    
+    // Get FFmpeg PID (id() returns Option<u32> on all platforms)
+    let ffmpeg_pid = ffmpeg_handle.id();
+    
+    if let Some(pid) = ffmpeg_pid {
+        eprintln!("📹 FFmpeg started with PID: {}", pid);
+    } else {
+        eprintln!("📹 FFmpeg started (PID not available)");
+    }
     
     // Start HTTP server
     let server_state = hls_state.clone();
@@ -1364,16 +1779,22 @@ async fn start_hls_server_cmd(
     });
     
     // Start localtunnel
-    let (tunnel_handle, tunnel_url, tunnel_domain) = match start_localtunnel(port).await {
-        Ok((handle, url, domain)) => {
-            eprintln!("✅ Tunnel created: {}", url);
-            eprintln!("   Domain: {}", domain);
-            (Some(handle), Some(url), Some(domain))
+    let (tunnel_handle, tunnel_url, tunnel_domain, tunnel_pid) = match start_localtunnel(port).await {
+        Ok((mut handle, url, domain)) => {
+            // Get tunnel PID (id() returns Option<u32> on all platforms)
+            let pid = handle.id();
+            
+            if let Some(p) = pid {
+                eprintln!("🌐 Tunnel started with PID: {}", p);
+            } else {
+                eprintln!("🌐 Tunnel started (PID not available)");
+            }
+            (Some(handle), Some(url), Some(domain), pid)
         }
         Err(e) => {
             eprintln!("⚠️  Failed to create tunnel: {}", e);
             eprintln!("   Server still running on localhost - tunnel creation failed");
-            (None, None, None)
+            (None, None, None, None)
         }
     };
     
@@ -1382,8 +1803,10 @@ async fn start_hls_server_cmd(
         let mut handle_opt = state.lock().unwrap();
         *handle_opt = Some(HlsServerHandle {
             ffmpeg_handle: Some(ffmpeg_handle),
+            ffmpeg_pid,
             server_handle,
             tunnel_handle,
+            tunnel_pid,
             access_code: access_code.clone(),
             port,
             tunnel_url: tunnel_url.clone(),
@@ -1407,6 +1830,86 @@ async fn start_hls_server_cmd(
     Ok(response)
 }
 
+// Helper function to kill a process on Windows (kills process tree)
+#[cfg(target_os = "windows")]
+async fn kill_process_tree_windows(pid: u32) -> Result<(), String> {
+    use std::process::Command as StdCommand;
+    
+    // Use taskkill to kill the process and all its children
+    let output = StdCommand::new("taskkill")
+        .args(&["/F", "/T", "/PID", &pid.to_string()])
+        .output();
+    
+    match output {
+        Ok(output) => {
+            if output.status.success() {
+                eprintln!("✅ Killed process tree for PID {}", pid);
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // "The process not found" is okay - it might already be dead
+                if stderr.contains("not found") {
+                    eprintln!("ℹ️  Process {} already terminated", pid);
+                    Ok(())
+                } else {
+                    eprintln!("⚠️  taskkill warning for PID {}: {}", pid, stderr);
+                    Ok(()) // Still return Ok, process might be dead
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("⚠️  Failed to run taskkill for PID {}: {}", pid, e);
+            Err(format!("Failed to kill process: {}", e))
+        }
+    }
+}
+
+// Helper function to kill a process (cross-platform)
+async fn kill_process_forcefully(child: &mut tokio::process::Child, pid: Option<u32>) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        // On Windows, use taskkill to kill process tree
+        if let Some(pid) = pid {
+            // Try to get PID from child if not provided
+            let actual_pid = pid;
+            if let Err(e) = kill_process_tree_windows(actual_pid).await {
+                eprintln!("⚠️  Failed to kill process tree, trying direct kill: {}", e);
+                // Fallback to direct kill
+                if let Err(e) = child.kill().await {
+                    eprintln!("⚠️  Direct kill also failed: {}", e);
+                    return Err(format!("Failed to kill process: {}", e));
+                }
+            }
+        } else {
+            // No PID, try direct kill
+            if let Err(e) = child.kill().await {
+                eprintln!("⚠️  Direct kill failed: {}", e);
+                return Err(format!("Failed to kill process: {}", e));
+            }
+        }
+        
+        // Wait a bit for process to terminate
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        
+        // Try to wait for the process to exit
+        let _ = child.wait().await;
+    }
+    
+    #[cfg(not(target_os = "windows"))]
+    {
+        // On macOS/Linux, direct kill should work
+        if let Err(e) = child.kill().await {
+            eprintln!("⚠️  Failed to kill process: {}", e);
+            return Err(format!("Failed to kill process: {}", e));
+        }
+        
+        // Wait for process to terminate
+        let _ = child.wait().await;
+    }
+    
+    Ok(())
+}
+
 // Tauri command to stop HLS server
 #[tauri::command]
 async fn stop_hls_server_cmd(
@@ -1418,16 +1921,34 @@ async fn stop_hls_server_cmd(
     };
     
     if let Some(mut handle) = handle_opt {
+        eprintln!("🛑 Stopping HLS server...");
+        
         // Kill FFmpeg
         if let Some(mut ffmpeg) = handle.ffmpeg_handle.take() {
-            let _ = ffmpeg.kill().await;
+            eprintln!("  Killing FFmpeg process...");
+            let ffmpeg_pid = handle.ffmpeg_pid;
+            if let Err(e) = kill_process_forcefully(&mut ffmpeg, ffmpeg_pid).await {
+                eprintln!("⚠️  Warning: Failed to kill FFmpeg: {}", e);
+            } else {
+                eprintln!("  ✅ FFmpeg stopped");
+            }
         }
+        
         // Kill tunnel
         if let Some(mut tunnel) = handle.tunnel_handle.take() {
-            let _ = tunnel.kill().await;
+            eprintln!("  Killing tunnel process...");
+            let tunnel_pid = handle.tunnel_pid;
+            if let Err(e) = kill_process_forcefully(&mut tunnel, tunnel_pid).await {
+                eprintln!("⚠️  Warning: Failed to kill tunnel: {}", e);
+            } else {
+                eprintln!("  ✅ Tunnel stopped");
+            }
         }
+        
         // Abort server task
+        eprintln!("  Stopping HTTP server...");
         handle.server_handle.abort();
+        eprintln!("  ✅ HTTP server stopped");
         
         // Clean up HLS directory
         eprintln!("🧹 Cleaning up HLS directory on server stop...");
@@ -1435,6 +1956,7 @@ async fn stop_hls_server_cmd(
             eprintln!("⚠️  Warning: Failed to cleanup HLS directory: {}", e);
         }
         
+        eprintln!("✅ HLS server fully stopped");
         Ok(())
     } else {
         Err("HLS server is not running".to_string())
