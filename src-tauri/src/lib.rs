@@ -595,6 +595,136 @@ async fn check_ffmpeg() -> Result<bool, String> {
     }
 }
 
+// List available FFmpeg devices (macOS avfoundation)
+#[tauri::command]
+async fn list_ffmpeg_devices() -> Result<serde_json::Value, String> {
+    eprintln!("🔍 Starting FFmpeg device detection...");
+    
+    #[cfg(target_os = "macos")]
+    {
+        eprintln!("📱 Running on macOS, using avfoundation");
+        let output = Command::new("ffmpeg")
+            .args(&["-f", "avfoundation", "-list_devices", "true", "-i", ""])
+            .output()
+            .await
+            .map_err(|e| {
+                eprintln!("❌ Failed to run ffmpeg command: {}", e);
+                format!("Failed to run ffmpeg: {}", e)
+            })?;
+        
+        eprintln!("✅ FFmpeg command executed, exit code: {:?}", output.status.code());
+        
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("📄 FFmpeg stderr output ({} bytes):", stderr.len());
+        eprintln!("--- START FFmpeg Output ---");
+        for (i, line) in stderr.lines().enumerate() {
+            eprintln!("Line {}: {}", i + 1, line);
+        }
+        eprintln!("--- END FFmpeg Output ---");
+        
+        // Parse video devices
+        let mut video_devices = Vec::new();
+        let mut audio_devices = Vec::new();
+        let mut in_video_section = false;
+        let mut in_audio_section = false;
+        
+        eprintln!("🔎 Parsing device list...");
+        for (line_num, line) in stderr.lines().enumerate() {
+            if line.contains("AVFoundation video devices:") {
+                eprintln!("📹 Found video devices section at line {}", line_num + 1);
+                in_video_section = true;
+                in_audio_section = false;
+                continue;
+            }
+            if line.contains("AVFoundation audio devices:") {
+                eprintln!("🔊 Found audio devices section at line {}", line_num + 1);
+                in_audio_section = true;
+                in_video_section = false;
+                continue;
+            }
+            if line.contains("AVFoundation input device") {
+                continue;
+            }
+            
+            // Parse device line: [AVFoundation indev @ 0x...] [index] Device Name
+            if in_video_section || in_audio_section {
+                // Check if this line contains the AVFoundation indev pattern
+                if line.contains("[AVFoundation indev @") {
+                    // Find the second set of brackets (the device index)
+                    // Format: [AVFoundation indev @ 0x...] [0] Device Name
+                    if let Some(first_bracket_end) = line.find(']') {
+                        // Look for the second bracket after the first one
+                        let after_first = &line[first_bracket_end + 1..];
+                        if let Some(second_bracket_start) = after_first.find('[') {
+                            if let Some(second_bracket_end) = after_first[second_bracket_start + 1..].find(']') {
+                                let index_str = &after_first[second_bracket_start + 1..second_bracket_start + 1 + second_bracket_end];
+                                if let Ok(index) = index_str.trim().parse::<usize>() {
+                                    // Device name is everything after the second bracket
+                                    let name_start = second_bracket_start + 1 + second_bracket_end + 1;
+                                    let name = after_first[name_start..].trim().to_string();
+                                    
+                                    if !name.is_empty() {
+                                        eprintln!("  ✓ Found device: [{}] \"{}\" (section: {})", 
+                                            index, name, 
+                                            if in_video_section { "video" } else { "audio" });
+                                        if in_video_section {
+                                            video_devices.push(serde_json::json!({
+                                                "index": index,
+                                                "name": name
+                                            }));
+                                        } else if in_audio_section {
+                                            audio_devices.push(serde_json::json!({
+                                                "index": index,
+                                                "name": name
+                                            }));
+                                        }
+                                    } else {
+                                        eprintln!("  ⚠️  Line {}: Empty device name: {}", line_num + 1, line);
+                                    }
+                                } else {
+                                    eprintln!("  ⚠️  Line {}: Could not parse index '{}' from: {}", line_num + 1, index_str, line);
+                                }
+                            } else {
+                                eprintln!("  ⚠️  Line {}: No closing bracket for device index: {}", line_num + 1, line);
+                            }
+                        } else {
+                            eprintln!("  ⚠️  Line {}: No second bracket found: {}", line_num + 1, line);
+                        }
+                    }
+                }
+            }
+        }
+        
+        eprintln!("📊 Parsing complete:");
+        eprintln!("  Video devices found: {}", video_devices.len());
+        for device in &video_devices {
+            eprintln!("    - [{}] {}", device["index"], device["name"]);
+        }
+        eprintln!("  Audio devices found: {}", audio_devices.len());
+        for device in &audio_devices {
+            eprintln!("    - [{}] {}", device["index"], device["name"]);
+        }
+        
+        let result = serde_json::json!({
+            "video": video_devices,
+            "audio": audio_devices
+        });
+        
+        eprintln!("✅ Returning device list to frontend");
+        Ok(result)
+    }
+    
+    #[cfg(not(target_os = "macos"))]
+    {
+        eprintln!("⚠️  Not running on macOS, returning empty device list");
+        // For non-macOS platforms, return empty lists
+        Ok(serde_json::json!({
+            "video": [],
+            "audio": []
+        }))
+    }
+}
+
 // Check if localtunnel is available (via npx)
 #[tauri::command]
 async fn check_localtunnel() -> Result<bool, String> {
@@ -755,9 +885,10 @@ fn generate_access_code() -> String {
 }
 
 // Get platform-specific FFmpeg input arguments
-fn get_ffmpeg_input_args() -> Vec<String> {
+fn get_ffmpeg_input_args(device: Option<&str>) -> Vec<String> {
     #[cfg(target_os = "macos")]
     {
+        let device_str = device.unwrap_or("2:0"); // Default to 2:0
         vec![
             "-f".to_string(),
             "avfoundation".to_string(),
@@ -766,11 +897,12 @@ fn get_ffmpeg_input_args() -> Vec<String> {
             "-video_size".to_string(),
             "1920x1080".to_string(),
             "-i".to_string(),
-            "2:0".to_string(), // Device 2 (screen), Audio 0
+            device_str.to_string(),
         ]
     }
     #[cfg(target_os = "windows")]
     {
+        let _ = device; // Unused on Windows
         vec![
             "-f".to_string(),
             "gdigrab".to_string(),
@@ -780,6 +912,7 @@ fn get_ffmpeg_input_args() -> Vec<String> {
     }
     #[cfg(target_os = "linux")]
     {
+        let _ = device; // Unused on Linux
         vec![
             "-f".to_string(),
             "x11grab".to_string(),
@@ -791,12 +924,13 @@ fn get_ffmpeg_input_args() -> Vec<String> {
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
+        let _ = device; // Unused
         vec![] // Unknown platform
     }
 }
 
 // Start FFmpeg process
-async fn start_ffmpeg(public_dir: &PathBuf) -> anyhow::Result<tokio::process::Child> {
+async fn start_ffmpeg(public_dir: &PathBuf, device: Option<&str>) -> anyhow::Result<tokio::process::Child> {
     // Ensure public directory exists
     fs::create_dir_all(public_dir)?;
     
@@ -812,7 +946,7 @@ async fn start_ffmpeg(public_dir: &PathBuf) -> anyhow::Result<tokio::process::Ch
     ];
     
     // Add platform-specific input
-    args.extend(get_ffmpeg_input_args());
+    args.extend(get_ffmpeg_input_args(device));
     
     // Add encoding and output args
     args.extend(vec![
@@ -1051,6 +1185,7 @@ async fn start_hls_server(state: Arc<HlsServerState>) -> anyhow::Result<()> {
 async fn start_hls_server_cmd(
     state: tauri::State<'_, Arc<Mutex<Option<HlsServerHandle>>>>,
     app_handle: tauri::AppHandle,
+    device: Option<String>,
 ) -> Result<serde_json::Value, String> {
     // Check if server is already running
     {
@@ -1077,8 +1212,9 @@ async fn start_hls_server_cmd(
         public_dir: public_dir.clone(),
     });
     
-    // Start FFmpeg
-    let ffmpeg_handle = start_ffmpeg(&public_dir)
+    // Start FFmpeg with device selection
+    let device_str = device.as_deref();
+    let ffmpeg_handle = start_ffmpeg(&public_dir, device_str)
         .await
         .map_err(|e| format!("Failed to start FFmpeg: {}", e))?;
     
@@ -1263,6 +1399,7 @@ pub fn run() {
             refresh_file_index,
             hide_window,
             check_ffmpeg,
+            list_ffmpeg_devices,
             start_hls_server_cmd,
             stop_hls_server_cmd,
             get_hls_server_info,
