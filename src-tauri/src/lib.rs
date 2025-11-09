@@ -10,6 +10,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::fs;
 use std::path::PathBuf;
 use walkdir::WalkDir;
+use std::collections::HashMap;
+use std::process::Stdio;
+use tokio::process::Command;
+use futures_util::{SinkExt, StreamExt};
+use axum::{
+    extract::{ws::WebSocketUpgrade, State},
+    http::StatusCode,
+    response::{Html, IntoResponse, Response},
+    routing::get,
+    Router,
+};
+use tower_http::cors::CorsLayer;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClipboardItem {
@@ -502,10 +514,11 @@ fn hide_window(app: tauri::AppHandle) {
         let _ = window.hide();
     }
 }
+
 fn start_clipboard_monitor(app_handle: tauri::AppHandle, db: Arc<Mutex<ClipboardDatabase>>) {
     std::thread::spawn(move || {
         let mut last_content = String::new();
-        
+    
         loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
             
@@ -547,6 +560,933 @@ fn start_clipboard_monitor(app_handle: tauri::AppHandle, db: Arc<Mutex<Clipboard
             }
         }
     });
+}
+
+// ========== HLS Screen Sharing Server ==========
+
+#[derive(Debug, Clone)]
+struct HlsServerState {
+    access_code: String,
+    port: u16,
+    public_dir: PathBuf,
+    viewers: Arc<Mutex<std::collections::HashMap<String, std::time::SystemTime>>>, // IP -> last seen
+}
+
+struct HlsServerHandle {
+    ffmpeg_handle: Option<tokio::process::Child>,
+    server_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+    tunnel_handle: Option<tokio::process::Child>,
+    access_code: String,
+    port: u16,
+    tunnel_url: Option<String>,
+    tunnel_domain: Option<String>,
+    public_dir: PathBuf,
+    viewers: Arc<Mutex<std::collections::HashMap<String, std::time::SystemTime>>>,
+}
+
+// Check if FFmpeg is available
+#[tauri::command]
+async fn check_ffmpeg() -> Result<bool, String> {
+    let output = Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .await;
+    
+    match output {
+        Ok(output) => Ok(output.status.success()),
+        Err(_) => Ok(false),
+    }
+}
+
+// List available FFmpeg devices (macOS avfoundation)
+#[tauri::command]
+async fn list_ffmpeg_devices() -> Result<serde_json::Value, String> {
+    eprintln!("🔍 Starting FFmpeg device detection...");
+    
+    #[cfg(target_os = "macos")]
+    {
+        eprintln!("📱 Running on macOS, using avfoundation");
+        let output = Command::new("ffmpeg")
+            .args(&["-f", "avfoundation", "-list_devices", "true", "-i", ""])
+            .output()
+            .await
+            .map_err(|e| {
+                eprintln!("❌ Failed to run ffmpeg command: {}", e);
+                format!("Failed to run ffmpeg: {}", e)
+            })?;
+        
+        eprintln!("✅ FFmpeg command executed, exit code: {:?}", output.status.code());
+        
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("📄 FFmpeg stderr output ({} bytes):", stderr.len());
+        eprintln!("--- START FFmpeg Output ---");
+        for (i, line) in stderr.lines().enumerate() {
+            eprintln!("Line {}: {}", i + 1, line);
+        }
+        eprintln!("--- END FFmpeg Output ---");
+        
+        // Parse video devices
+        let mut video_devices = Vec::new();
+        let mut audio_devices = Vec::new();
+        let mut in_video_section = false;
+        let mut in_audio_section = false;
+        
+        eprintln!("🔎 Parsing device list...");
+        for (line_num, line) in stderr.lines().enumerate() {
+            if line.contains("AVFoundation video devices:") {
+                eprintln!("📹 Found video devices section at line {}", line_num + 1);
+                in_video_section = true;
+                in_audio_section = false;
+                continue;
+            }
+            if line.contains("AVFoundation audio devices:") {
+                eprintln!("🔊 Found audio devices section at line {}", line_num + 1);
+                in_audio_section = true;
+                in_video_section = false;
+                continue;
+            }
+            if line.contains("AVFoundation input device") {
+                continue;
+            }
+            
+            // Parse device line: [AVFoundation indev @ 0x...] [index] Device Name
+            if in_video_section || in_audio_section {
+                // Check if this line contains the AVFoundation indev pattern
+                if line.contains("[AVFoundation indev @") {
+                    // Find the second set of brackets (the device index)
+                    // Format: [AVFoundation indev @ 0x...] [0] Device Name
+                    if let Some(first_bracket_end) = line.find(']') {
+                        // Look for the second bracket after the first one
+                        let after_first = &line[first_bracket_end + 1..];
+                        if let Some(second_bracket_start) = after_first.find('[') {
+                            if let Some(second_bracket_end) = after_first[second_bracket_start + 1..].find(']') {
+                                let index_str = &after_first[second_bracket_start + 1..second_bracket_start + 1 + second_bracket_end];
+                                if let Ok(index) = index_str.trim().parse::<usize>() {
+                                    // Device name is everything after the second bracket
+                                    let name_start = second_bracket_start + 1 + second_bracket_end + 1;
+                                    let name = after_first[name_start..].trim().to_string();
+                                    
+                                    if !name.is_empty() {
+                                        eprintln!("  ✓ Found device: [{}] \"{}\" (section: {})", 
+                                            index, name, 
+                                            if in_video_section { "video" } else { "audio" });
+                                        if in_video_section {
+                                            video_devices.push(serde_json::json!({
+                                                "index": index,
+                                                "name": name
+                                            }));
+                                        } else if in_audio_section {
+                                            audio_devices.push(serde_json::json!({
+                                                "index": index,
+                                                "name": name
+                                            }));
+            }
+        } else {
+                                        eprintln!("  ⚠️  Line {}: Empty device name: {}", line_num + 1, line);
+                                    }
+        } else {
+                                    eprintln!("  ⚠️  Line {}: Could not parse index '{}' from: {}", line_num + 1, index_str, line);
+            }
+        } else {
+                                eprintln!("  ⚠️  Line {}: No closing bracket for device index: {}", line_num + 1, line);
+                            }
+        } else {
+                            eprintln!("  ⚠️  Line {}: No second bracket found: {}", line_num + 1, line);
+                        }
+                    }
+                }
+            }
+        }
+        
+        eprintln!("📊 Parsing complete:");
+        eprintln!("  Video devices found: {}", video_devices.len());
+        for device in &video_devices {
+            eprintln!("    - [{}] {}", device["index"], device["name"]);
+        }
+        eprintln!("  Audio devices found: {}", audio_devices.len());
+        for device in &audio_devices {
+            eprintln!("    - [{}] {}", device["index"], device["name"]);
+        }
+        
+        let result = serde_json::json!({
+            "video": video_devices,
+            "audio": audio_devices
+        });
+        
+        eprintln!("✅ Returning device list to frontend");
+        Ok(result)
+    }
+    
+    #[cfg(not(target_os = "macos"))]
+    {
+        eprintln!("⚠️  Not running on macOS, returning empty device list");
+        // For non-macOS platforms, return empty lists
+        Ok(serde_json::json!({
+            "video": [],
+            "audio": []
+        }))
+    }
+}
+
+// Check if localtunnel is available (via npx)
+#[tauri::command]
+async fn check_localtunnel() -> Result<bool, String> {
+    // Check if npx is available
+    let npx_check = Command::new("npx")
+        .arg("--version")
+        .output()
+        .await;
+    
+    if npx_check.is_err() {
+        return Ok(false);
+    }
+    
+    // Try to run localtunnel --help (this will download it if needed, but we just check if it works)
+    // Actually, we'll just check if npx works - localtunnel will be downloaded on first use
+    Ok(true)
+}
+
+// Start localtunnel and parse the URL
+async fn start_localtunnel(port: u16) -> anyhow::Result<(tokio::process::Child, String, String)> {
+    let mut cmd = Command::new("npx");
+    cmd.args(&["-y", "localtunnel", "--port", &port.to_string()]);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    
+    let mut child = cmd.spawn()?;
+    
+    // Wait a bit for localtunnel to start and output the URL
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    
+    // Helper function to extract URL and domain from a line
+    fn extract_url_and_domain(line: &str) -> Option<(String, String)> {
+        // Look for URL pattern: "https://xxx.loca.lt" anywhere in the line
+        if line.contains("https://") && line.contains(".loca.lt") {
+            if let Some(url_start) = line.find("https://") {
+                let url_part = &line[url_start..];
+                // Find the end of the URL (space, newline, or end of string)
+                let url_end = url_part
+                    .find(' ')
+                    .or_else(|| url_part.find('\n'))
+                    .or_else(|| url_part.find('\r'))
+                    .unwrap_or(url_part.len());
+                
+                let url = url_part[..url_end].trim().to_string();
+                
+                // Extract domain (e.g., "xxx" from "https://xxx.loca.lt")
+                // URL format is "https://xxx.loca.lt"
+                if let Some(domain_start) = url.find("https://") {
+                    let after_https = &url[domain_start + 8..]; // Skip "https://"
+                    if let Some(domain_end) = after_https.find(".loca.lt") {
+                        let domain = after_https[..domain_end].to_string();
+                        return Some((url, domain));
+                    }
+                }
+            }
+        }
+        None
+    }
+    
+    // Try to read from stderr first (localtunnel usually outputs to stderr)
+    let mut found_url = None;
+    let mut stderr_consumed = false;
+    
+    if let Some(mut stderr) = child.stderr.take() {
+        let reader = BufReader::new(&mut stderr);
+        let mut lines = reader.lines();
+        
+        // Read lines for a few seconds to find the URL
+        let timeout = tokio::time::sleep(tokio::time::Duration::from_secs(8));
+        tokio::pin!(timeout);
+        
+        loop {
+            tokio::select! {
+                _ = &mut timeout => {
+                    break;
+                }
+                line_result = lines.next_line() => {
+                    match line_result {
+                        Ok(Some(line)) => {
+                            eprintln!("Localtunnel stderr: {}", line);
+                            if let Some((url, domain)) = extract_url_and_domain(&line) {
+                                found_url = Some((url, domain));
+                                stderr_consumed = true;
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+        
+        // Put stderr back if we haven't consumed it
+        if !stderr_consumed {
+            child.stderr = Some(stderr);
+        }
+    }
+    
+    // If not found in stderr, try stdout
+    let mut stdout_consumed = false;
+    if found_url.is_none() {
+        if let Some(mut stdout) = child.stdout.take() {
+            let reader = BufReader::new(&mut stdout);
+            let mut lines = reader.lines();
+            
+            let timeout = tokio::time::sleep(tokio::time::Duration::from_secs(5));
+            tokio::pin!(timeout);
+            
+            loop {
+                tokio::select! {
+                    _ = &mut timeout => {
+                        break;
+                    }
+                    line_result = lines.next_line() => {
+                        match line_result {
+                            Ok(Some(line)) => {
+                                eprintln!("Localtunnel stdout: {}", line);
+                                if let Some((url, domain)) = extract_url_and_domain(&line) {
+                                    found_url = Some((url, domain));
+                                    stdout_consumed = true;
+                                    break;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+            
+            // Put stdout back if we haven't consumed it
+            if !stdout_consumed {
+                child.stdout = Some(stdout);
+            }
+        }
+    }
+    
+    if let Some((url, domain)) = found_url {
+        Ok((child, url, domain))
+    } else {
+        // Wait a bit more and check if process is still running
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        Err(anyhow::anyhow!("Could not parse localtunnel URL from output. Check if localtunnel is working correctly."))
+    }
+}
+
+// Generate random 6-character access code
+fn generate_access_code() -> String {
+    use rand::Rng;
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut rng = rand::thread_rng();
+    (0..6)
+        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+        .collect()
+}
+
+// Get platform-specific FFmpeg input arguments
+fn get_ffmpeg_input_args(device: Option<&str>) -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let device_str = device.unwrap_or("2:0"); // Default to 2:0
+        vec![
+            "-f".to_string(),
+            "avfoundation".to_string(),
+            "-framerate".to_string(),
+            "30".to_string(),
+            "-video_size".to_string(),
+            "1920x1080".to_string(),
+            "-i".to_string(),
+            device_str.to_string(),
+        ]
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = device; // Unused on Windows
+        vec![
+            "-f".to_string(),
+            "gdigrab".to_string(),
+            "-i".to_string(),
+            "desktop".to_string(),
+        ]
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = device; // Unused on Linux
+        vec![
+            "-f".to_string(),
+            "x11grab".to_string(),
+            "-video_size".to_string(),
+            "1920x1080".to_string(),
+            "-i".to_string(),
+            ":0.0".to_string(),
+        ]
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        let _ = device; // Unused
+        vec![] // Unknown platform
+    }
+}
+
+// Cleanup HLS directory - remove all .ts and .m3u8 files
+fn cleanup_hls_directory(public_dir: &PathBuf) -> Result<(), String> {
+    eprintln!("🧹 Cleaning up HLS directory: {}", public_dir.display());
+    
+    if !public_dir.exists() {
+        eprintln!("  Directory doesn't exist, skipping cleanup");
+        return Ok(());
+    }
+    
+    let mut cleaned_count = 0;
+    match fs::read_dir(public_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry) => {
+                        let path = entry.path();
+                        if path.is_file() {
+                            if let Some(ext) = path.extension() {
+                                if ext == "ts" || ext == "m3u8" {
+                                    match fs::remove_file(&path) {
+                                        Ok(_) => {
+                                            cleaned_count += 1;
+                                            eprintln!("  ✓ Removed: {}", path.file_name().unwrap_or_default().to_string_lossy());
+                                        }
+                                        Err(e) => {
+                                            eprintln!("  ⚠️  Failed to remove {}: {}", path.display(), e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  ⚠️  Error reading directory entry: {}", e);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            return Err(format!("Failed to read HLS directory: {}", e));
+        }
+    }
+    
+    eprintln!("✅ Cleanup complete: removed {} files", cleaned_count);
+    Ok(())
+}
+
+// Start FFmpeg process
+async fn start_ffmpeg(public_dir: &PathBuf, device: Option<&str>) -> anyhow::Result<tokio::process::Child> {
+    // Clean up old files first
+    cleanup_hls_directory(public_dir).map_err(|e| anyhow::anyhow!("Cleanup failed: {}", e))?;
+    
+    // Ensure public directory exists
+    fs::create_dir_all(public_dir)?;
+    
+    let mut args = vec![
+        "-loglevel".to_string(),
+        "info".to_string(),
+        "-fflags".to_string(),
+        "+genpts".to_string(),
+        "-probesize".to_string(),
+        "50M".to_string(),
+        "-analyzeduration".to_string(),
+        "50M".to_string(),
+    ];
+    
+    // Add platform-specific input
+    args.extend(get_ffmpeg_input_args(device));
+    
+    // Add encoding and output args
+    args.extend(vec![
+        "-c:v".to_string(),
+        "libx264".to_string(),
+        "-preset".to_string(),
+        "ultrafast".to_string(),
+        "-tune".to_string(),
+        "zerolatency".to_string(),
+        "-profile:v".to_string(),
+        "baseline".to_string(),
+        "-level".to_string(),
+        "3.0".to_string(),
+        "-pix_fmt".to_string(),
+        "yuv420p".to_string(),
+        "-c:a".to_string(),
+        "aac".to_string(),
+        "-ar".to_string(),
+        "44100".to_string(),
+        "-b:a".to_string(),
+        "128k".to_string(),
+        "-ac".to_string(),
+        "2".to_string(),
+        "-f".to_string(),
+        "hls".to_string(),
+        "-hls_time".to_string(),
+        "2".to_string(),
+        "-hls_list_size".to_string(),
+        "5".to_string(),
+        "-hls_flags".to_string(),
+        "delete_segments+independent_segments".to_string(),
+        "-hls_segment_type".to_string(),
+        "mpegts".to_string(),
+        "-hls_segment_filename".to_string(),
+        format!("{}/segment_%03d.ts", public_dir.display()),
+        format!("{}/stream.m3u8", public_dir.display()),
+    ]);
+    
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(&args);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    
+    let child = cmd.spawn()?;
+    Ok(child)
+}
+
+// HTTP handler for API info
+async fn hls_api_info(State(state): State<Arc<HlsServerState>>) -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "code": state.access_code,
+        "port": state.port,
+    }))
+}
+
+
+// Serve HLS segment files with auth
+async fn serve_hls_file(
+    path: axum::extract::Path<String>,
+    State(state): State<Arc<HlsServerState>>,
+    headers: axum::http::HeaderMap,
+    query: axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let path_str = path.as_str();
+    eprintln!("📦 Request for segment: {}", path_str);
+    
+    // Validate access code for segment files
+    let provided_code = headers
+        .get("x-access-code")
+        .and_then(|h| h.to_str().ok())
+        .or_else(|| query.get("code").map(|s| s.as_str()));
+    
+    if let Some(code) = provided_code {
+        if code != state.access_code {
+            eprintln!("❌ Invalid access code for segment: {}", path_str);
+            return Err(StatusCode::FORBIDDEN);
+        }
+    } else {
+        eprintln!("❌ No access code provided for segment: {}", path_str);
+        return Err(StatusCode::FORBIDDEN);
+    }
+    
+    // Construct full filename (path is like "012.ts" from route "/segment_:path")
+    let filename = format!("segment_{}", path_str);
+    let file_path = state.public_dir.join(&filename);
+    
+    eprintln!("📁 Looking for file: {}", file_path.display());
+    eprintln!("📁 Public dir: {}", state.public_dir.display());
+    
+    if file_path.exists() {
+        eprintln!("✅ Found segment file: {}", filename);
+        let content = fs::read(&file_path).map_err(|e| {
+            eprintln!("❌ Error reading file: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        let content_type = "video/mp2t";
+        
+        Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, content_type)],
+            content,
+        ))
+    } else {
+        eprintln!("❌ Segment file not found: {}", filename);
+        // List files in directory for debugging
+        if let Ok(entries) = fs::read_dir(&state.public_dir) {
+            eprintln!("📂 Files in public dir:");
+            for entry in entries.flatten() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    eprintln!("  - {}", name);
+                }
+            }
+        }
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+// Start HLS server
+async fn start_hls_server(state: Arc<HlsServerState>) -> anyhow::Result<()> {
+    use axum::routing::get;
+    
+    // Helper to get client IP
+    fn get_client_ip(headers: &axum::http::HeaderMap) -> String {
+        // Try to get IP from X-Forwarded-For (for tunnel) or X-Real-IP
+        if let Some(forwarded) = headers.get("x-forwarded-for") {
+            if let Ok(forwarded_str) = forwarded.to_str() {
+                // Take the first IP if there are multiple
+                if let Some(ip) = forwarded_str.split(',').next() {
+                    return ip.trim().to_string();
+                }
+            }
+        }
+        if let Some(real_ip) = headers.get("x-real-ip") {
+            if let Ok(ip_str) = real_ip.to_str() {
+                return ip_str.to_string();
+            }
+        }
+        // Fallback to "unknown"
+        "unknown".to_string()
+    }
+    
+    // Helper to track viewer
+    // For better tracking, we use IP + User-Agent as a unique identifier
+    // This helps distinguish multiple clients behind the same tunnel
+    fn track_viewer(state: &Arc<HlsServerState>, ip: String, user_agent: Option<&str>) {
+        let mut viewers = state.viewers.lock().unwrap();
+        
+        // Create a unique viewer ID from IP and User-Agent
+        let viewer_id = if let Some(ua) = user_agent {
+            format!("{}|{}", ip, ua)
+        } else {
+            ip.clone()
+        };
+        
+        let was_new = !viewers.contains_key(&viewer_id);
+        viewers.insert(viewer_id.clone(), SystemTime::now());
+        let count = viewers.len();
+        
+        if was_new {
+            eprintln!("👥 New viewer connected: {} (Total: {})", ip, count);
+        }
+    }
+    
+    // Handler for stream.m3u8 (no path param)
+    async fn serve_stream_m3u8(
+        State(state): State<Arc<HlsServerState>>,
+        headers: axum::http::HeaderMap,
+        query: axum::extract::Query<std::collections::HashMap<String, String>>,
+    ) -> Result<impl IntoResponse, StatusCode> {
+        // Validate access code
+        let provided_code = headers
+            .get("x-access-code")
+            .and_then(|h| h.to_str().ok())
+            .or_else(|| query.get("code").map(|s| s.as_str()));
+        
+        if let Some(code) = provided_code {
+            if code != state.access_code {
+                return Err(StatusCode::FORBIDDEN);
+            }
+        } else {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        
+        // Track viewer
+        let client_ip = get_client_ip(&headers);
+        let user_agent = headers.get("user-agent")
+            .and_then(|h| h.to_str().ok());
+        track_viewer(&state, client_ip, user_agent);
+        
+        let file_path = state.public_dir.join("stream.m3u8");
+        if file_path.exists() {
+            let content = fs::read(&file_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            Ok((
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
+                content,
+            ))
+        } else {
+            Err(StatusCode::NOT_FOUND)
+        }
+    }
+    
+    // Handler for segment files using a catch-all approach
+    async fn serve_segment_catchall(
+        uri: axum::http::Uri,
+        State(state): State<Arc<HlsServerState>>,
+        headers: axum::http::HeaderMap,
+        query: axum::extract::Query<std::collections::HashMap<String, String>>,
+    ) -> Result<impl IntoResponse, StatusCode> {
+        let path = uri.path().trim_start_matches('/');
+        eprintln!("📦 Request for: {}", path);
+        
+        // Only handle segment files
+        if !path.starts_with("segment_") || !path.ends_with(".ts") {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        
+        // Validate access code
+        let provided_code = headers
+            .get("x-access-code")
+            .and_then(|h| h.to_str().ok())
+            .or_else(|| query.get("code").map(|s| s.as_str()));
+        
+        if let Some(code) = provided_code {
+            if code != state.access_code {
+                eprintln!("❌ Invalid access code for segment: {}", path);
+                return Err(StatusCode::FORBIDDEN);
+            }
+        } else {
+            eprintln!("❌ No access code provided for segment: {}", path);
+            return Err(StatusCode::FORBIDDEN);
+        }
+        
+        // Track viewer (update timestamp to keep them active)
+        let client_ip = get_client_ip(&headers);
+        let user_agent = headers.get("user-agent")
+            .and_then(|h| h.to_str().ok());
+        track_viewer(&state, client_ip, user_agent);
+        
+        let file_path = state.public_dir.join(path);
+        eprintln!("📁 Looking for file: {}", file_path.display());
+        
+        if file_path.exists() {
+            eprintln!("✅ Found segment file: {}", path);
+            let content = fs::read(&file_path).map_err(|e| {
+                eprintln!("❌ Error reading file: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            
+            Ok((
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "video/mp2t")],
+                content,
+            ))
+        } else {
+            eprintln!("❌ Segment file not found: {}", path);
+            // List files in directory for debugging
+            if let Ok(entries) = fs::read_dir(&state.public_dir) {
+                eprintln!("📂 Files in public dir:");
+                for entry in entries.flatten() {
+                    if let Ok(name) = entry.file_name().into_string() {
+                        eprintln!("  - {}", name);
+                    }
+                }
+            }
+            Err(StatusCode::NOT_FOUND)
+        }
+    }
+    
+    use axum::routing::any;
+    
+    // Spawn cleanup task to remove stale viewers (older than 15 seconds)
+    // HLS clients typically request segments every 2 seconds, so 15 seconds is a safe timeout
+    let cleanup_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            let mut viewers = cleanup_state.viewers.lock().unwrap();
+            let now = SystemTime::now();
+            let before_count = viewers.len();
+            let timeout_secs = 15; // Remove viewers inactive for 15 seconds
+            
+            viewers.retain(|ip, last_seen| {
+                if let Ok(duration) = now.duration_since(*last_seen) {
+                    let is_active = duration.as_secs() < timeout_secs;
+                    if !is_active {
+                        eprintln!("  🗑️  Removing inactive viewer: {} (last seen {}s ago)", ip, duration.as_secs());
+                    }
+                    is_active
+                } else {
+                    eprintln!("  🗑️  Removing viewer with invalid timestamp: {}", ip);
+                    false
+                }
+            });
+            let after_count = viewers.len();
+            if before_count != after_count {
+                eprintln!("🧹 Cleaned up {} stale viewers. Active: {}", before_count - after_count, after_count);
+            }
+        }
+    });
+    
+    let app = Router::new()
+        .route("/api/info", get(hls_api_info))
+        .route("/stream.m3u8", get(serve_stream_m3u8))
+        .fallback(any(serve_segment_catchall))
+        .layer(CorsLayer::permissive())
+        .with_state(state.clone());
+    
+    let addr = format!("127.0.0.1:{}", state.port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    eprintln!("✅ HLS server started on http://{}", addr);
+    eprintln!("   Access code: {}", state.access_code);
+    
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+// Tauri command to start HLS server
+#[tauri::command]
+async fn start_hls_server_cmd(
+    state: tauri::State<'_, Arc<Mutex<Option<HlsServerHandle>>>>,
+    app_handle: tauri::AppHandle,
+    device: Option<String>,
+) -> Result<serde_json::Value, String> {
+    // Check if server is already running
+    {
+        let mut handle_opt = state.lock().unwrap();
+        if handle_opt.is_some() {
+            return Err("HLS server is already running".to_string());
+        }
+    }
+    
+    // Get app data directory for public folder
+    let app_data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    let public_dir = app_data_dir.join("hls_public");
+    
+    // Generate access code
+    let access_code = generate_access_code();
+    let port = 3000u16;
+    
+    let hls_state = Arc::new(HlsServerState {
+        access_code: access_code.clone(),
+        port,
+        public_dir: public_dir.clone(),
+        viewers: Arc::new(Mutex::new(std::collections::HashMap::new())),
+    });
+    
+    // Start FFmpeg with device selection
+    let device_str = device.as_deref();
+    let ffmpeg_handle = start_ffmpeg(&public_dir, device_str)
+        .await
+        .map_err(|e| format!("Failed to start FFmpeg: {}", e))?;
+    
+    // Start HTTP server
+    let server_state = hls_state.clone();
+    let server_handle = tokio::spawn(async move {
+        start_hls_server(server_state).await
+    });
+    
+    // Start localtunnel
+    let (tunnel_handle, tunnel_url, tunnel_domain) = match start_localtunnel(port).await {
+        Ok((handle, url, domain)) => {
+            eprintln!("✅ Tunnel created: {}", url);
+            eprintln!("   Domain: {}", domain);
+            (Some(handle), Some(url), Some(domain))
+        }
+        Err(e) => {
+            eprintln!("⚠️  Failed to create tunnel: {}", e);
+            eprintln!("   Server still running on localhost - tunnel creation failed");
+            (None, None, None)
+        }
+    };
+    
+    // Store handle
+    {
+        let mut handle_opt = state.lock().unwrap();
+        *handle_opt = Some(HlsServerHandle {
+            ffmpeg_handle: Some(ffmpeg_handle),
+            server_handle,
+            tunnel_handle,
+            access_code: access_code.clone(),
+            port,
+            tunnel_url: tunnel_url.clone(),
+            tunnel_domain: tunnel_domain.clone(),
+            public_dir: public_dir.clone(),
+            viewers: hls_state.viewers.clone(),
+        });
+    }
+    
+    let mut response = serde_json::json!({
+        "code": access_code,
+        "port": port,
+        "url": format!("http://localhost:{}", port),
+    });
+    
+    if let (Some(ref url), Some(ref domain)) = (tunnel_url, tunnel_domain) {
+        response["tunnelUrl"] = serde_json::Value::String(url.clone());
+        response["tunnelDomain"] = serde_json::Value::String(domain.clone());
+    }
+    
+    Ok(response)
+}
+
+// Tauri command to stop HLS server
+#[tauri::command]
+async fn stop_hls_server_cmd(
+    state: tauri::State<'_, Arc<Mutex<Option<HlsServerHandle>>>>,
+) -> Result<(), String> {
+    let handle_opt = {
+        let mut guard = state.lock().unwrap();
+        guard.take()
+    };
+    
+    if let Some(mut handle) = handle_opt {
+        // Kill FFmpeg
+        if let Some(mut ffmpeg) = handle.ffmpeg_handle.take() {
+            let _ = ffmpeg.kill().await;
+        }
+        // Kill tunnel
+        if let Some(mut tunnel) = handle.tunnel_handle.take() {
+            let _ = tunnel.kill().await;
+        }
+        // Abort server task
+        handle.server_handle.abort();
+        
+        // Clean up HLS directory
+        eprintln!("🧹 Cleaning up HLS directory on server stop...");
+        if let Err(e) = cleanup_hls_directory(&handle.public_dir) {
+            eprintln!("⚠️  Warning: Failed to cleanup HLS directory: {}", e);
+        }
+        
+        Ok(())
+    } else {
+        Err("HLS server is not running".to_string())
+    }
+}
+
+// Tauri command to get HLS server info
+#[tauri::command]
+async fn get_hls_server_info(
+    state: tauri::State<'_, Arc<Mutex<Option<HlsServerHandle>>>>,
+) -> Result<Option<serde_json::Value>, String> {
+    let handle_opt = state.lock().unwrap();
+    if let Some(handle) = handle_opt.as_ref() {
+        // Get viewer count
+        let viewer_count = {
+            let viewers = handle.viewers.lock().unwrap();
+            viewers.len()
+        };
+        
+        let mut info = serde_json::json!({
+            "running": true,
+            "code": handle.access_code,
+            "port": handle.port,
+            "url": format!("http://localhost:{}", handle.port),
+            "viewers": viewer_count,
+        });
+        
+        if let Some(ref tunnel_url) = handle.tunnel_url {
+            info["tunnelUrl"] = serde_json::Value::String(tunnel_url.clone());
+        }
+        if let Some(ref tunnel_domain) = handle.tunnel_domain {
+            info["tunnelDomain"] = serde_json::Value::String(tunnel_domain.clone());
+        }
+        
+        Ok(Some(info))
+    } else {
+        Ok(None)
+    }
+}
+
+// Tauri command to get viewer count
+#[tauri::command]
+async fn get_hls_viewer_count(
+    state: tauri::State<'_, Arc<Mutex<Option<HlsServerHandle>>>>,
+) -> Result<usize, String> {
+    let handle_opt = state.lock().unwrap();
+    if let Some(handle) = handle_opt.as_ref() {
+        let viewers = handle.viewers.lock().unwrap();
+        Ok(viewers.len())
+    } else {
+        Ok(0)
+    }
 }
 
 pub fn run() {
@@ -599,6 +1539,10 @@ pub fn run() {
             // Start clipboard monitor
             start_clipboard_monitor(app.handle().clone(), db.clone());
 
+            // Initialize HLS server state
+            let hls_server_state = Arc::new(Mutex::new(None::<HlsServerHandle>));
+            app.manage(hls_server_state);
+
             #[cfg(desktop)]
             {
                 // --- FIX 2: Register the shortcut ---
@@ -623,6 +1567,12 @@ pub fn run() {
             open_file,
             refresh_file_index,
             hide_window,
+            check_ffmpeg,
+            list_ffmpeg_devices,
+            start_hls_server_cmd,
+            stop_hls_server_cmd,
+            get_hls_server_info,
+            get_hls_viewer_count,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri");

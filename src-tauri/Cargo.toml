@@ -28,3 +28,9 @@ uuid = { version = "1.0", features = ["v4"] }
 enigo = "0.2.0"
 walkdir = "2.4"
 dirs = "5.0"
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+anyhow = "1.0"
+axum = { version = "0.7", features = ["macros", "ws"] }
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+rand = "0.8"
