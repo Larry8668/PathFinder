@@ -5,7 +5,7 @@ import HomeOptions from "./components/HomeOptions";
 import ClipboardPage from "./components/ClipboardPage";
 import OnlineSearchPage from "./components/OnlineSearchPage";
 import OpenFilePage from "./components/OpenFilePage";
-import ScreenSharePage from "./components/ScreenSharePage";
+import HlsScreenSharePage from "./components/HlsScreenSharePage";
 import GuidePage from "./components/guidePages/GuidePage";
 
 
@@ -79,7 +79,7 @@ function App() {
             <OnlineSearchPage query={query} />
           )}
           {currentPage === "open-app" && <OpenFilePage query={query} />}
-          {currentPage === "screen-share" && <ScreenSharePage query={query} />}
+          {currentPage === "hls-screen-share" && <HlsScreenSharePage query={query} />}
           {currentPage === "open-guide" && <GuidePage query={query} />}
         </div>
       </div>

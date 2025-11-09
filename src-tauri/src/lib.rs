@@ -11,6 +11,8 @@ use std::fs;
 use std::path::PathBuf;
 use walkdir::WalkDir;
 use std::collections::HashMap;
+use std::process::Stdio;
+use tokio::process::Command;
 use futures_util::{SinkExt, StreamExt};
 use axum::{
     extract::{ws::WebSocketUpgrade, State},
@@ -513,1007 +515,6 @@ fn hide_window(app: tauri::AppHandle) {
     }
 }
 
-// ============================================================================
-// WebRTC Screen Sharing - WebSocket Signaling Server
-// ============================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum SignalingMessage {
-    #[serde(rename = "join")]
-    Join {
-        code: String,
-        role: String, // "sharer" or "viewer"
-    },
-    #[serde(rename = "offer")]
-    Offer {
-        code: String,
-        sdp: String,
-        #[serde(rename = "sdpType")]
-        sdp_type: String,
-    },
-    #[serde(rename = "answer")]
-    Answer {
-        code: String,
-        sdp: String,
-        #[serde(rename = "sdpType")]
-        sdp_type: String,
-    },
-    #[serde(rename = "ice-candidate")]
-    IceCandidate {
-        code: String,
-        candidate: String,
-        sdp_mid: Option<String>,
-        sdp_m_line_index: Option<u16>,
-    },
-    #[serde(rename = "error")]
-    Error {
-        message: String,
-    },
-    #[serde(rename = "viewer-joined")]
-    ViewerJoined {
-        code: String,
-    },
-}
-
-
-#[derive(Debug, Clone)]
-pub struct ShareSession {
-    pub code: String,
-    pub sharer: Option<tokio::sync::mpsc::UnboundedSender<axum::extract::ws::Message>>,
-    pub viewers: Vec<tokio::sync::mpsc::UnboundedSender<axum::extract::ws::Message>>,
-    pub created_at: u64,
-    pub pending_offer: Option<SignalingMessage>,
-}
-
-#[derive(Debug, Clone)]
-pub struct SignalingServerState {
-    pub sessions: Arc<Mutex<HashMap<String, ShareSession>>>,
-}
-
-impl SignalingServerState {
-    fn new() -> Self {
-        Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    fn create_session(&self) -> String {
-        let code = format!("{:06X}", uuid::Uuid::new_v4().as_u128() % 16777216);
-        let session = ShareSession {
-            code: code.clone(),
-            sharer: None,
-            viewers: Vec::new(),
-            created_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            pending_offer: None,
-        };
-        self.sessions.lock().unwrap().insert(code.clone(), session);
-        code
-    }
-
-    fn add_sharer(&self, code: &str, sender: tokio::sync::mpsc::UnboundedSender<axum::extract::ws::Message>) -> bool {
-        let mut sessions = self.sessions.lock().unwrap();
-        eprintln!("add_sharer called with code: {}, sessions available: {:?}", code, sessions.keys().collect::<Vec<_>>());
-        if let Some(session) = sessions.get_mut(code) {
-            session.sharer = Some(sender);
-            eprintln!("Sharer added successfully for code: {}", code);
-            true
-        } else {
-            eprintln!("Session not found for code: {}", code);
-            false
-        }
-    }
-
-    fn add_viewer(&self, code: &str, sender: tokio::sync::mpsc::UnboundedSender<axum::extract::ws::Message>) -> bool {
-        let mut sessions = self.sessions.lock().unwrap();
-        if let Some(session) = sessions.get_mut(code) {
-            session.viewers.push(sender);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn broadcast_to_viewers(&self, code: &str, message: &SignalingMessage) {
-        let sessions = self.sessions.lock().unwrap();
-        if let Some(session) = sessions.get(code) {
-            let msg_str = serde_json::to_string(message).unwrap();
-            eprintln!("Broadcasting to {} viewer(s) for code {}: {}", session.viewers.len(), code, msg_str);
-            for viewer in &session.viewers {
-                if viewer.send(axum::extract::ws::Message::Text(msg_str.clone())).is_err() {
-                    eprintln!("Failed to send message to viewer");
-                } else {
-                    eprintln!("Successfully sent message to viewer");
-                }
-            }
-        } else {
-            eprintln!("No session found for code {} when broadcasting to viewers", code);
-        }
-    }
-
-    fn send_to_sharer(&self, code: &str, message: &SignalingMessage) -> bool {
-        let sessions = self.sessions.lock().unwrap();
-        if let Some(session) = sessions.get(code) {
-            if let Some(ref sharer) = session.sharer {
-                let msg_str = serde_json::to_string(message).unwrap();
-                eprintln!("Sending message to sharer for code {}: {}", code, msg_str);
-                let result = sharer.send(axum::extract::ws::Message::Text(msg_str)).is_ok();
-                if result {
-                    eprintln!("Successfully sent message to sharer");
-                } else {
-                    eprintln!("Failed to send message to sharer");
-                }
-                return result;
-            } else {
-                eprintln!("No sharer found for code {}", code);
-            }
-        } else {
-            eprintln!("No session found for code {} when sending to sharer", code);
-        }
-        false
-    }
-}
-
-// HTML pages for sharer and viewer
-const SHARER_HTML: &str = r#"
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Screen Share - Sharer</title>
-    <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            max-width: 800px;
-            margin: 50px auto;
-            padding: 20px;
-            background: #1a1a1a;
-            color: white;
-        }
-        .container {
-            background: #2a2a2a;
-            padding: 30px;
-            border-radius: 10px;
-        }
-        h1 { margin-top: 0; }
-        .code-input {
-            padding: 15px;
-            font-size: 18px;
-            width: 200px;
-            text-align: center;
-            letter-spacing: 4px;
-            border: 2px solid #007AFF;
-            border-radius: 6px;
-            background: #1a1a1a;
-            color: white;
-            text-transform: uppercase;
-        }
-        button {
-            padding: 12px 24px;
-            font-size: 16px;
-            background: #007AFF;
-            color: white;
-            border: none;
-            border-radius: 6px;
-            cursor: pointer;
-            margin: 10px 5px;
-        }
-        button:hover { background: #0056CC; }
-        button:disabled {
-            background: #555;
-            cursor: not-allowed;
-        }
-        .status {
-            margin: 20px 0;
-            padding: 15px;
-            background: #333;
-            border-radius: 6px;
-        }
-        .error {
-            color: #FF3B30;
-            margin: 10px 0;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🖥️ Screen Share - Sharer</h1>
-        <div>
-            <label>Share Code: <input type="text" id="codeInput" class="code-input" maxlength="6" placeholder="EC2449"></label>
-            <button onclick="connect()">Connect & Start Sharing</button>
-        </div>
-        <div id="status" class="status"></div>
-        <div id="error" class="error"></div>
-    </div>
-    <script>
-        let ws = null;
-        let pc = null;
-        let localStream = null;
-        let pendingIceCandidates = [];
-        let offerSent = false;
-        const codeInput = document.getElementById('codeInput');
-        const statusDiv = document.getElementById('status');
-        const errorDiv = document.getElementById('error');
-
-        function updateStatus(msg) {
-            statusDiv.textContent = msg;
-        }
-
-        function showError(msg) {
-            errorDiv.textContent = '❌ ' + msg;
-        }
-
-        async function connect() {
-            const code = codeInput.value.toUpperCase().trim();
-            if (!code || code.length !== 6) {
-                showError('Please enter a valid 6-character code');
-                return;
-            }
-
-            updateStatus('Connecting...');
-            
-            // Connect WebSocket
-            ws = new WebSocket('ws://localhost:8765/ws');
-            
-            ws.onopen = () => {
-                console.log('WebSocket opened, sending join message...');
-                ws.send(JSON.stringify({ type: 'join', code: code, role: 'sharer' }));
-                updateStatus('Connected, waiting for server confirmation...');
-            };
-
-            ws.onmessage = async (event) => {
-                try {
-                    const msg = JSON.parse(event.data);
-                    console.log('Received message:', msg);
-                    
-                    if (msg.type === 'joined') {
-                        console.log('Joined successfully, starting screen capture...');
-                        updateStatus('Joined! Starting screen capture...');
-                        await startScreenCapture(code);
-                    } else if (msg.type === 'answer') {
-                        console.log('Answer received');
-                        await handleAnswer(msg);
-                    } else if (msg.type === 'viewer-joined') {
-                        console.log('Viewer joined notification');
-                        updateStatus('Viewer connected, waiting for them to receive stream...');
-                    } else if (msg.type === 'ice-candidate') {
-                        console.log('ICE candidate received');
-                        await handleIceCandidate(msg);
-                    } else if (msg.type === 'error') {
-                        console.error('Server error:', msg.message);
-                        showError(msg.message);
-                    } else {
-                        console.log('Unknown message type:', msg.type);
-                    }
-                } catch (err) {
-                    console.error('Error parsing message:', err);
-                    showError('Failed to parse server message');
-                }
-            };
-
-            ws.onerror = (e) => {
-                console.error('WebSocket error:', e);
-                showError('WebSocket connection error');
-                updateStatus('Connection failed');
-            };
-
-            ws.onclose = () => {
-                console.log('WebSocket closed');
-                updateStatus('Connection closed');
-            };
-        }
-
-        async function startScreenCapture(code) {
-            try {
-                console.log('Requesting screen capture...');
-                updateStatus('Requesting screen access... Please allow screen sharing in browser prompt.');
-                
-                if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
-                    throw new Error('getDisplayMedia is not supported in this browser');
-                }
-                
-                localStream = await navigator.mediaDevices.getDisplayMedia({
-                    video: { 
-                        mediaSource: 'screen',
-                        width: { ideal: 1920 },
-                        height: { ideal: 1080 }
-                    },
-                    audio: false
-                });
-                
-                console.log('Screen captured successfully, tracks:', localStream.getTracks().length);
-                updateStatus('Screen captured, creating connection...');
-                
-                pc = new RTCPeerConnection({
-                    iceServers: []
-                });
-                
-                localStream.getTracks().forEach(track => {
-                    pc.addTrack(track, localStream);
-                });
-                
-                let sharerCandidateCount = 0;
-                pc.onicecandidate = (event) => {
-                    if (event.candidate && ws.readyState === WebSocket.OPEN) {
-                        sharerCandidateCount++;
-                        console.log('Sharer ICE candidate #' + sharerCandidateCount + ':', event.candidate.candidate.substring(0, 80));
-                        ws.send(JSON.stringify({
-                            type: 'ice-candidate',
-                            code: code,
-                            candidate: event.candidate.candidate,
-                            sdp_mid: event.candidate.sdpMid,
-                            sdp_m_line_index: event.candidate.sdpMLineIndex
-                        }));
-                        console.log('Sharer ICE candidate sent');
-                    } else if (!event.candidate) {
-                        console.log('Sharer ICE gathering complete (null candidate). Total candidates: ' + sharerCandidateCount);
-                    }
-                };
-                
-                pc.onconnectionstatechange = () => {
-                    console.log('Sharer connection state changed:', pc.connectionState);
-                    updateStatus('Connection: ' + pc.connectionState);
-                    if (pc.connectionState === 'connected') {
-                        updateStatus('✅ Sharing screen!');
-                    } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-                        console.error('Connection failed. ICE connection state:', pc.iceConnectionState);
-                        console.error('Signaling state:', pc.signalingState);
-                    }
-                };
-                
-                pc.oniceconnectionstatechange = () => {
-                    console.log('Sharer ICE connection state:', pc.iceConnectionState);
-                    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
-                        updateStatus('✅ ICE connected!');
-                    } else if (pc.iceConnectionState === 'failed') {
-                        console.error('ICE connection failed');
-                        updateStatus('❌ ICE connection failed');
-                    }
-                };
-                
-                // Create offer with ICE trickling enabled
-                console.log('Creating WebRTC offer...');
-                const offer = await pc.createOffer({
-                    offerToReceiveVideo: true,
-                    offerToReceiveAudio: false
-                });
-                console.log('Offer created, setting local description...');
-                
-                // Set local description - this starts ICE gathering
-                await pc.setLocalDescription(offer);
-                console.log('Local description set, ICE gathering started');
-                
-                // Wait for ICE gathering to complete before sending offer
-                // But also send the offer immediately so viewer can start processing
-                // ICE candidates will trickle in
-                pc.onicegatheringstatechange = async () => {
-                    console.log('ICE gathering state:', pc.iceGatheringState);
-                    if (pc.iceGatheringState === 'complete') {
-                        console.log('ICE gathering complete');
-                    }
-                };
-                
-                // Send offer immediately with trickle ICE
-                await createOffer(code);
-                
-            } catch (err) {
-                console.error('Screen capture error:', err);
-                showError('Screen capture failed: ' + err.message);
-                updateStatus('Failed: ' + err.message);
-            }
-        }
-
-        async function createOffer(code) {
-            const offer = pc.localDescription;
-            console.log('Creating and sending offer with code:', code);
-            console.log('Offer SDP length:', offer.sdp.length);
-            const offerMsg = {
-                type: 'offer',
-                code: code,
-                sdp: offer.sdp,
-                sdpType: offer.type
-            };
-            console.log('Sending offer message:', JSON.stringify(offerMsg).substring(0, 200) + '...');
-            ws.send(JSON.stringify(offerMsg));
-            updateStatus('Offer sent, waiting for viewer...');
-        }
-
-        async function handleAnswer(msg) {
-            try {
-                console.log('Setting remote description from answer...');
-                await pc.setRemoteDescription(new RTCSessionDescription({
-                    type: msg.sdpType,
-                    sdp: msg.sdp
-                }));
-                console.log('Remote description set successfully');
-                console.log('Current signaling state:', pc.signalingState);
-                console.log('Current ICE connection state:', pc.iceConnectionState);
-                
-                // Now process any pending ICE candidates
-                console.log('Processing', pendingIceCandidates.length, 'pending ICE candidates...');
-                for (const candidate of pendingIceCandidates) {
-                    try {
-                        await pc.addIceCandidate(new RTCIceCandidate(candidate));
-                        console.log('Added pending ICE candidate');
-                    } catch (err) {
-                        console.error('Error adding pending ICE candidate:', err);
-                    }
-                }
-                pendingIceCandidates = [];
-                
-                // Continue sending any ICE candidates that come after answer is set
-                console.log('Waiting for additional ICE candidates after answer...');
-            } catch (err) {
-                showError('Failed to handle answer: ' + err.message);
-                console.error(err);
-            }
-        }
-
-        let sharerIceCandidateReceived = 0;
-        async function handleIceCandidate(msg) {
-            try {
-                sharerIceCandidateReceived++;
-                console.log('Sharer received ICE candidate #' + sharerIceCandidateReceived + ' from viewer:', msg.candidate.substring(0, 80));
-                
-                // If remote description is not set yet, buffer the candidate
-                if (!pc.remoteDescription) {
-                    console.log('Remote description not set yet, buffering ICE candidate');
-                    pendingIceCandidates.push({
-                        candidate: msg.candidate,
-                        sdpMid: msg.sdp_mid,
-                        sdpMLineIndex: msg.sdp_m_line_index
-                    });
-                    return;
-                }
-                
-                // Remote description is set, add candidate immediately
-                await pc.addIceCandidate(new RTCIceCandidate({
-                    candidate: msg.candidate,
-                    sdpMid: msg.sdp_mid,
-                    sdpMLineIndex: msg.sdp_m_line_index
-                }));
-                console.log('Sharer: ICE candidate #' + sharerIceCandidateReceived + ' added successfully');
-            } catch (err) {
-                console.error('Sharer: ICE candidate error:', err);
-                // If it fails, try buffering it
-                pendingIceCandidates.push({
-                    candidate: msg.candidate,
-                    sdpMid: msg.sdp_mid,
-                    sdpMLineIndex: msg.sdp_m_line_index
-                });
-            }
-        }
-    </script>
-</body>
-</html>
-"#;
-
-const VIEWER_HTML: &str = r#"
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Screen Share - Viewer</title>
-    <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            max-width: 1200px;
-            margin: 50px auto;
-            padding: 20px;
-            background: #1a1a1a;
-            color: white;
-        }
-        .container {
-            background: #2a2a2a;
-            padding: 30px;
-            border-radius: 10px;
-        }
-        h1 { margin-top: 0; }
-        .code-input {
-            padding: 15px;
-            font-size: 18px;
-            width: 200px;
-            text-align: center;
-            letter-spacing: 4px;
-            border: 2px solid #007AFF;
-            border-radius: 6px;
-            background: #1a1a1a;
-            color: white;
-            text-transform: uppercase;
-        }
-        button {
-            padding: 12px 24px;
-            font-size: 16px;
-            background: #007AFF;
-            color: white;
-            border: none;
-            border-radius: 6px;
-            cursor: pointer;
-            margin: 10px 5px;
-        }
-        button:hover { background: #0056CC; }
-        button:disabled {
-            background: #555;
-            cursor: not-allowed;
-        }
-        .status {
-            margin: 20px 0;
-            padding: 15px;
-            background: #333;
-            border-radius: 6px;
-        }
-        .error {
-            color: #FF3B30;
-            margin: 10px 0;
-        }
-        video {
-            width: 100%;
-            max-width: 100%;
-            border: 2px solid #555;
-            border-radius: 8px;
-            background: #000;
-            margin-top: 20px;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>👁️ Screen Share - Viewer</h1>
-        <div>
-            <label>Share Code: <input type="text" id="codeInput" class="code-input" maxlength="6" placeholder="EC2449"></label>
-            <button onclick="connect()">Connect</button>
-        </div>
-        <div id="status" class="status">Enter code and click Connect</div>
-        <div id="error" class="error"></div>
-        <video id="video" autoplay playsinline></video>
-    </div>
-    <script>
-        let ws = null;
-        let pc = null;
-        let pendingIceCandidates = [];
-        const codeInput = document.getElementById('codeInput');
-        const statusDiv = document.getElementById('status');
-        const errorDiv = document.getElementById('error');
-        const video = document.getElementById('video');
-
-        function updateStatus(msg) {
-            statusDiv.textContent = msg;
-        }
-
-        function showError(msg) {
-            errorDiv.textContent = '❌ ' + msg;
-        }
-
-        async function connect() {
-            const code = codeInput.value.toUpperCase().trim();
-            if (!code || code.length !== 6) {
-                showError('Please enter a valid 6-character code');
-                return;
-            }
-
-            updateStatus('Connecting...');
-            
-            ws = new WebSocket('ws://localhost:8765/ws');
-            
-            ws.onopen = () => {
-                ws.send(JSON.stringify({ type: 'join', code: code, role: 'viewer' }));
-                updateStatus('Connected, waiting for stream...');
-            };
-
-            ws.onmessage = async (event) => {
-                const msg = JSON.parse(event.data);
-                console.log('Received:', msg);
-                
-                if (msg.type === 'joined') {
-                    updateStatus('Joined, waiting for sharer...');
-                    console.log('Viewer joined successfully, waiting for offer...');
-                } else if (msg.type === 'offer') {
-                    console.log('Offer received in viewer!', msg);
-                    await handleOffer(msg, code);
-                } else if (msg.type === 'ice-candidate') {
-                    await handleIceCandidate(msg);
-                } else if (msg.type === 'error') {
-                    showError(msg.message);
-                }
-            };
-
-            ws.onerror = (e) => {
-                showError('WebSocket error');
-                console.error(e);
-            };
-        }
-
-        async function handleOffer(msg, code) {
-            try {
-                updateStatus('Offer received, creating connection...');
-                
-                pc = new RTCPeerConnection({
-                    iceServers: []
-                });
-                
-                pc.ontrack = (event) => {
-                    console.log('Received track:', event);
-                    if (event.streams[0]) {
-                        video.srcObject = event.streams[0];
-                        updateStatus('✅ Stream received!');
-                    }
-                };
-                
-                let viewerCandidateCount = 0;
-                pc.onicecandidate = (event) => {
-                    if (event.candidate && ws.readyState === WebSocket.OPEN) {
-                        viewerCandidateCount++;
-                        console.log('Viewer ICE candidate #' + viewerCandidateCount + ':', event.candidate.candidate.substring(0, 80));
-                        ws.send(JSON.stringify({
-                            type: 'ice-candidate',
-                            code: code,
-                            candidate: event.candidate.candidate,
-                            sdp_mid: event.candidate.sdpMid,
-                            sdp_m_line_index: event.candidate.sdpMLineIndex
-                        }));
-                        console.log('Viewer ICE candidate sent');
-                    } else if (!event.candidate) {
-                        console.log('Viewer ICE gathering complete (null candidate). Total candidates: ' + viewerCandidateCount);
-                    }
-                };
-                
-                pc.onconnectionstatechange = () => {
-                    console.log('Viewer connection state changed:', pc.connectionState);
-                    updateStatus('Connection: ' + pc.connectionState);
-                    if (pc.connectionState === 'connected') {
-                        updateStatus('✅ Connected!');
-                    }
-                };
-                
-                pc.oniceconnectionstatechange = () => {
-                    console.log('Viewer ICE connection state:', pc.iceConnectionState);
-                    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
-                        updateStatus('✅ ICE connected!');
-                    } else if (pc.iceConnectionState === 'failed') {
-                        console.error('ICE connection failed');
-                        updateStatus('❌ ICE connection failed');
-                    }
-                };
-                
-                console.log('Setting remote description from offer...');
-                await pc.setRemoteDescription(new RTCSessionDescription({
-                    type: msg.sdpType,
-                    sdp: msg.sdp
-                }));
-                console.log('Remote description set, processing pending ICE candidates...');
-                
-                // Process any pending ICE candidates now that remote description is set
-                for (const candidate of pendingIceCandidates) {
-                    try {
-                        await pc.addIceCandidate(new RTCIceCandidate(candidate));
-                        console.log('Added pending ICE candidate');
-                    } catch (err) {
-                        console.error('Error adding pending ICE candidate:', err);
-                    }
-                }
-                pendingIceCandidates = [];
-                
-                console.log('Creating answer...');
-                const answer = await pc.createAnswer({ offerToReceiveVideo: true });
-                await pc.setLocalDescription(answer);
-                console.log('Local description set from answer');
-                
-                if (pc.iceGatheringState === 'complete') {
-                    sendAnswer(code);
-                } else {
-                    pc.onicegatheringstatechange = () => {
-                        if (pc.iceGatheringState === 'complete') {
-                            sendAnswer(code);
-                        }
-                    };
-                }
-                
-            } catch (err) {
-                showError('Failed to handle offer: ' + err.message);
-                console.error(err);
-            }
-        }
-
-        function sendAnswer(code) {
-            const answer = pc.localDescription;
-            ws.send(JSON.stringify({
-                type: 'answer',
-                code: code,
-                sdp: answer.sdp,
-                sdpType: answer.type
-            }));
-            updateStatus('Answer sent, establishing connection...');
-        }
-
-        let viewerIceCandidateReceived = 0;
-        async function handleIceCandidate(msg) {
-            if (!pc) return;
-            try {
-                viewerIceCandidateReceived++;
-                console.log('Viewer received ICE candidate #' + viewerIceCandidateReceived + ' from sharer:', msg.candidate.substring(0, 80));
-                
-                // If remote description is not set yet, buffer the candidate
-                if (!pc.remoteDescription) {
-                    console.log('Remote description not set yet, buffering ICE candidate');
-                    pendingIceCandidates.push({
-                        candidate: msg.candidate,
-                        sdpMid: msg.sdp_mid,
-                        sdpMLineIndex: msg.sdp_m_line_index
-                    });
-                    return;
-                }
-                
-                // Remote description is set, add candidate immediately
-                await pc.addIceCandidate(new RTCIceCandidate({
-                    candidate: msg.candidate,
-                    sdpMid: msg.sdp_mid,
-                    sdpMLineIndex: msg.sdp_m_line_index
-                }));
-                console.log('Viewer: ICE candidate #' + viewerIceCandidateReceived + ' added successfully');
-            } catch (err) {
-                console.error('Viewer: ICE candidate error:', err);
-                // If it fails, try buffering it
-                pendingIceCandidates.push({
-                    candidate: msg.candidate,
-                    sdpMid: msg.sdp_mid,
-                    sdpMLineIndex: msg.sdp_m_line_index
-                });
-            }
-        }
-    </script>
-</body>
-</html>
-"#;
-
-// Axum WebSocket handler
-async fn handle_websocket(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<SignalingServerState>>,
-) -> Response {
-    ws.on_upgrade(move |socket| async move {
-        handle_websocket_stream(socket, state).await;
-    })
-}
-
-async fn handle_websocket_stream(
-    socket: axum::extract::ws::WebSocket,
-    state: Arc<SignalingServerState>,
-) {
-    eprintln!("=== NEW WEBSOCKET CONNECTION ===");
-    let (mut sender, mut receiver) = socket.split();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-
-    let mut send_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if sender.send(msg).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let state_clone = state.clone();
-    let mut recv_task = tokio::spawn(async move {
-        let mut code: Option<String> = None;
-        let mut role: Option<String> = None;
-
-        while let Some(msg) = receiver.next().await {
-            match msg {
-                Ok(axum::extract::ws::Message::Text(text)) => {
-                    eprintln!("Received WebSocket message: {}", text);
-                    match serde_json::from_str::<SignalingMessage>(&text) {
-                        Ok(sig_msg) => {
-                            eprintln!("Parsed message successfully");
-                            match sig_msg {
-                            SignalingMessage::Join { code: join_code, role: join_role } => {
-                                code = Some(join_code.clone());
-                                role = Some(join_role.clone());
-                                eprintln!("Received join request: code={}, role={}", join_code, join_role);
-
-                                if join_role == "sharer" {
-                                    let tx_clone = tx.clone();
-                                    if state_clone.add_sharer(&join_code, tx_clone) {
-                                        let response = serde_json::json!({
-                                            "type": "joined",
-                                            "code": join_code,
-                                            "role": "sharer"
-                                        });
-                                        let msg = response.to_string();
-                                        eprintln!("Sending joined response to sharer: {}", msg);
-                                        if tx.send(axum::extract::ws::Message::Text(msg)).is_err() {
-                                            eprintln!("Failed to send joined message to sharer");
-                                        } else {
-                                            eprintln!("Successfully sent joined message to sharer");
-                                        }
-                                    } else {
-                                        let error = serde_json::json!({
-                                            "type": "error",
-                                            "message": format!("Session not found for code: {}", join_code)
-                                        });
-                                        let msg = error.to_string();
-                                        eprintln!("Sending error to sharer: {}", msg);
-                                        let _ = tx.send(axum::extract::ws::Message::Text(msg));
-                                    }
-                                } else if join_role == "viewer" {
-                                    eprintln!("Viewer trying to join with code: {}", join_code);
-                                    if state_clone.add_viewer(&join_code, tx.clone()) {
-                                        eprintln!("Viewer added successfully");
-                                        let response = serde_json::json!({
-                                            "type": "joined",
-                                            "code": join_code,
-                                            "role": "viewer"
-                                        });
-                                        let _ = tx.send(axum::extract::ws::Message::Text(response.to_string()));
-
-                                        let notify = SignalingMessage::ViewerJoined {
-                                            code: join_code.clone(),
-                                        };
-                                        eprintln!("Notifying sharer that viewer joined");
-                                        state_clone.send_to_sharer(&join_code, &notify);
-                                        
-                                        // Check if there's already an offer for this session and send it to the new viewer
-                                        eprintln!("Checking if there's an existing offer to send to viewer...");
-                                        let sessions = state_clone.sessions.lock().unwrap();
-                                        if let Some(session) = sessions.get(&join_code) {
-                                            if let Some(ref offer) = session.pending_offer {
-                                                let msg_str = serde_json::to_string(offer).unwrap();
-                                                eprintln!("Sending pending offer to new viewer");
-                                                drop(sessions);
-                                                let _ = tx.send(axum::extract::ws::Message::Text(msg_str));
-                                            } else {
-                                                eprintln!("No pending offer found");
-                                            }
-                                        }
-                                    } else {
-                                        let error = serde_json::json!({
-                                            "type": "error",
-                                            "message": "Session not found"
-                                        });
-                                        let _ = tx.send(axum::extract::ws::Message::Text(error.to_string()));
-                                    }
-                                }
-                            }
-                            SignalingMessage::Offer { code: ref msg_code, .. } => {
-                                eprintln!("Offer received from sharer, storing and broadcasting to viewers with code: {}", msg_code);
-                                // Store the offer in the session
-                                let mut sessions = state_clone.sessions.lock().unwrap();
-                                if let Some(session) = sessions.get_mut(msg_code) {
-                                    session.pending_offer = Some(sig_msg.clone());
-                                    eprintln!("Offer stored in session");
-                                }
-                                drop(sessions);
-                                // Broadcast to existing viewers
-                                state_clone.broadcast_to_viewers(msg_code, &sig_msg);
-                            }
-                            SignalingMessage::Answer { code: ref msg_code, .. } => {
-                                state_clone.send_to_sharer(msg_code, &sig_msg);
-                            }
-                            SignalingMessage::IceCandidate { code: ref msg_code, .. } => {
-                                if let Some(ref current_role) = role {
-                                    if current_role == "sharer" {
-                                        state_clone.broadcast_to_viewers(msg_code, &sig_msg);
-                                    } else {
-                                        state_clone.send_to_sharer(msg_code, &sig_msg);
-                                    }
-                                }
-                            }
-                            SignalingMessage::Error { .. } => {}
-                            SignalingMessage::ViewerJoined { .. } => {
-                                // Notification only, already sent to sharer
-                            }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to parse WebSocket message: {} - Raw: {}", e, text);
-                        }
-                    }
-                }
-                Ok(axum::extract::ws::Message::Close(_)) => break,
-                _ => {}
-            }
-        }
-    });
-
-    tokio::select! {
-        _ = (&mut send_task) => recv_task.abort(),
-        _ = (&mut recv_task) => send_task.abort(),
-    };
-}
-
-// HTTP handlers
-async fn sharer_page() -> Html<&'static str> {
-    Html(SHARER_HTML)
-}
-
-async fn viewer_page() -> Html<&'static str> {
-    Html(VIEWER_HTML)
-}
-
-
-// Start the signaling server with HTTP + WebSocket
-async fn start_signaling_server(state: Arc<SignalingServerState>, port: u16) -> anyhow::Result<()> {
-    eprintln!("=== STARTING SIGNALING SERVER ===");
-    eprintln!("Creating router...");
-    let app = Router::new()
-        .route("/", get(sharer_page))
-        .route("/sharer", get(sharer_page))
-        .route("/viewer", get(viewer_page))
-        .route("/ws", get(handle_websocket))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
-
-    let addr = format!("127.0.0.1:{}", port);
-    eprintln!("Binding to {}...", addr);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    eprintln!("✅ HTTP server started on http://{}", addr);
-    eprintln!("  Sharer: http://{}/sharer", addr);
-    eprintln!("  Viewer: http://{}/viewer", addr);
-    eprintln!("Server is ready and listening for connections...");
-    
-    axum::serve(listener, app).await?;
-    Ok(())
-}
-
-// Tauri command to start the signaling server
-#[tauri::command]
-async fn start_signaling_server_cmd(
-    state: tauri::State<'_, Arc<Mutex<Option<Arc<SignalingServerState>>>>>,
-) -> Result<String, String> {
-    eprintln!("=== start_signaling_server_cmd called ===");
-    let mut server_state = state.lock().map_err(|e| e.to_string())?;
-    
-    // Check if server is already running
-    if server_state.is_some() {
-        eprintln!("Server already running!");
-        return Err("Signaling server is already running".to_string());
-    }
-    
-    // Create new server state
-    eprintln!("Creating new server state...");
-    let signaling_state = Arc::new(SignalingServerState::new());
-    let code = signaling_state.create_session();
-    eprintln!("Created session with code: {}", code);
-    
-    // Store state
-    *server_state = Some(signaling_state.clone());
-    
-    // Spawn server in background
-    eprintln!("Spawning server task...");
-    let signaling_state_for_server = signaling_state.clone();
-    tokio::spawn(async move {
-        eprintln!("Server task started");
-        if let Err(e) = start_signaling_server(signaling_state_for_server, 8765).await {
-            eprintln!("❌ Signaling server error: {}", e);
-        }
-    });
-    
-    eprintln!("Returning code: {}", code);
-    Ok(code)
-}
-
-#[tauri::command]
-fn get_signaling_server_url() -> String {
-    "http://localhost:8765".to_string()
-}
-
-#[tauri::command]
-async fn open_browser_url(url: String) -> Result<(), String> {
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::process::Command::new("open")
-            .arg(&url)
-            .spawn()
-            .map_err(|e| e.to_string())?;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", &url])
-            .spawn()
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
 fn start_clipboard_monitor(app_handle: tauri::AppHandle, db: Arc<Mutex<ClipboardDatabase>>) {
     std::thread::spawn(move || {
         let mut last_content = String::new();
@@ -1559,6 +560,628 @@ fn start_clipboard_monitor(app_handle: tauri::AppHandle, db: Arc<Mutex<Clipboard
             }
         }
     });
+}
+
+// ========== HLS Screen Sharing Server ==========
+
+#[derive(Debug, Clone)]
+struct HlsServerState {
+    access_code: String,
+    port: u16,
+    public_dir: PathBuf,
+}
+
+struct HlsServerHandle {
+    ffmpeg_handle: Option<tokio::process::Child>,
+    server_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+    tunnel_handle: Option<tokio::process::Child>,
+    access_code: String,
+    port: u16,
+    tunnel_url: Option<String>,
+    tunnel_domain: Option<String>,
+}
+
+// Check if FFmpeg is available
+#[tauri::command]
+async fn check_ffmpeg() -> Result<bool, String> {
+    let output = Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .await;
+    
+    match output {
+        Ok(output) => Ok(output.status.success()),
+        Err(_) => Ok(false),
+    }
+}
+
+// Check if localtunnel is available (via npx)
+#[tauri::command]
+async fn check_localtunnel() -> Result<bool, String> {
+    // Check if npx is available
+    let npx_check = Command::new("npx")
+        .arg("--version")
+        .output()
+        .await;
+    
+    if npx_check.is_err() {
+        return Ok(false);
+    }
+    
+    // Try to run localtunnel --help (this will download it if needed, but we just check if it works)
+    // Actually, we'll just check if npx works - localtunnel will be downloaded on first use
+    Ok(true)
+}
+
+// Start localtunnel and parse the URL
+async fn start_localtunnel(port: u16) -> anyhow::Result<(tokio::process::Child, String, String)> {
+    let mut cmd = Command::new("npx");
+    cmd.args(&["-y", "localtunnel", "--port", &port.to_string()]);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    
+    let mut child = cmd.spawn()?;
+    
+    // Wait a bit for localtunnel to start and output the URL
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    
+    // Helper function to extract URL and domain from a line
+    fn extract_url_and_domain(line: &str) -> Option<(String, String)> {
+        // Look for URL pattern: "https://xxx.loca.lt" anywhere in the line
+        if line.contains("https://") && line.contains(".loca.lt") {
+            if let Some(url_start) = line.find("https://") {
+                let url_part = &line[url_start..];
+                // Find the end of the URL (space, newline, or end of string)
+                let url_end = url_part
+                    .find(' ')
+                    .or_else(|| url_part.find('\n'))
+                    .or_else(|| url_part.find('\r'))
+                    .unwrap_or(url_part.len());
+                
+                let url = url_part[..url_end].trim().to_string();
+                
+                // Extract domain (e.g., "xxx" from "https://xxx.loca.lt")
+                // URL format is "https://xxx.loca.lt"
+                if let Some(domain_start) = url.find("https://") {
+                    let after_https = &url[domain_start + 8..]; // Skip "https://"
+                    if let Some(domain_end) = after_https.find(".loca.lt") {
+                        let domain = after_https[..domain_end].to_string();
+                        return Some((url, domain));
+                    }
+                }
+            }
+        }
+        None
+    }
+    
+    // Try to read from stderr first (localtunnel usually outputs to stderr)
+    let mut found_url = None;
+    let mut stderr_consumed = false;
+    
+    if let Some(mut stderr) = child.stderr.take() {
+        let reader = BufReader::new(&mut stderr);
+        let mut lines = reader.lines();
+        
+        // Read lines for a few seconds to find the URL
+        let timeout = tokio::time::sleep(tokio::time::Duration::from_secs(8));
+        tokio::pin!(timeout);
+        
+        loop {
+            tokio::select! {
+                _ = &mut timeout => {
+                    break;
+                }
+                line_result = lines.next_line() => {
+                    match line_result {
+                        Ok(Some(line)) => {
+                            eprintln!("Localtunnel stderr: {}", line);
+                            if let Some((url, domain)) = extract_url_and_domain(&line) {
+                                found_url = Some((url, domain));
+                                stderr_consumed = true;
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+        
+        // Put stderr back if we haven't consumed it
+        if !stderr_consumed {
+            child.stderr = Some(stderr);
+        }
+    }
+    
+    // If not found in stderr, try stdout
+    let mut stdout_consumed = false;
+    if found_url.is_none() {
+        if let Some(mut stdout) = child.stdout.take() {
+            let reader = BufReader::new(&mut stdout);
+            let mut lines = reader.lines();
+            
+            let timeout = tokio::time::sleep(tokio::time::Duration::from_secs(5));
+            tokio::pin!(timeout);
+            
+            loop {
+                tokio::select! {
+                    _ = &mut timeout => {
+                        break;
+                    }
+                    line_result = lines.next_line() => {
+                        match line_result {
+                            Ok(Some(line)) => {
+                                eprintln!("Localtunnel stdout: {}", line);
+                                if let Some((url, domain)) = extract_url_and_domain(&line) {
+                                    found_url = Some((url, domain));
+                                    stdout_consumed = true;
+                                    break;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+            
+            // Put stdout back if we haven't consumed it
+            if !stdout_consumed {
+                child.stdout = Some(stdout);
+            }
+        }
+    }
+    
+    if let Some((url, domain)) = found_url {
+        Ok((child, url, domain))
+    } else {
+        // Wait a bit more and check if process is still running
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        Err(anyhow::anyhow!("Could not parse localtunnel URL from output. Check if localtunnel is working correctly."))
+    }
+}
+
+// Generate random 6-character access code
+fn generate_access_code() -> String {
+    use rand::Rng;
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut rng = rand::thread_rng();
+    (0..6)
+        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+        .collect()
+}
+
+// Get platform-specific FFmpeg input arguments
+fn get_ffmpeg_input_args() -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![
+            "-f".to_string(),
+            "avfoundation".to_string(),
+            "-framerate".to_string(),
+            "30".to_string(),
+            "-video_size".to_string(),
+            "1920x1080".to_string(),
+            "-i".to_string(),
+            "2:0".to_string(), // Device 2 (screen), Audio 0
+        ]
+    }
+    #[cfg(target_os = "windows")]
+    {
+        vec![
+            "-f".to_string(),
+            "gdigrab".to_string(),
+            "-i".to_string(),
+            "desktop".to_string(),
+        ]
+    }
+    #[cfg(target_os = "linux")]
+    {
+        vec![
+            "-f".to_string(),
+            "x11grab".to_string(),
+            "-video_size".to_string(),
+            "1920x1080".to_string(),
+            "-i".to_string(),
+            ":0.0".to_string(),
+        ]
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        vec![] // Unknown platform
+    }
+}
+
+// Start FFmpeg process
+async fn start_ffmpeg(public_dir: &PathBuf) -> anyhow::Result<tokio::process::Child> {
+    // Ensure public directory exists
+    fs::create_dir_all(public_dir)?;
+    
+    let mut args = vec![
+        "-loglevel".to_string(),
+        "info".to_string(),
+        "-fflags".to_string(),
+        "+genpts".to_string(),
+        "-probesize".to_string(),
+        "50M".to_string(),
+        "-analyzeduration".to_string(),
+        "50M".to_string(),
+    ];
+    
+    // Add platform-specific input
+    args.extend(get_ffmpeg_input_args());
+    
+    // Add encoding and output args
+    args.extend(vec![
+        "-c:v".to_string(),
+        "libx264".to_string(),
+        "-preset".to_string(),
+        "ultrafast".to_string(),
+        "-tune".to_string(),
+        "zerolatency".to_string(),
+        "-profile:v".to_string(),
+        "baseline".to_string(),
+        "-level".to_string(),
+        "3.0".to_string(),
+        "-pix_fmt".to_string(),
+        "yuv420p".to_string(),
+        "-c:a".to_string(),
+        "aac".to_string(),
+        "-ar".to_string(),
+        "44100".to_string(),
+        "-b:a".to_string(),
+        "128k".to_string(),
+        "-ac".to_string(),
+        "2".to_string(),
+        "-f".to_string(),
+        "hls".to_string(),
+        "-hls_time".to_string(),
+        "2".to_string(),
+        "-hls_list_size".to_string(),
+        "5".to_string(),
+        "-hls_flags".to_string(),
+        "delete_segments+independent_segments".to_string(),
+        "-hls_segment_type".to_string(),
+        "mpegts".to_string(),
+        "-hls_segment_filename".to_string(),
+        format!("{}/segment_%03d.ts", public_dir.display()),
+        format!("{}/stream.m3u8", public_dir.display()),
+    ]);
+    
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(&args);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    
+    let child = cmd.spawn()?;
+    Ok(child)
+}
+
+// HTTP handler for API info
+async fn hls_api_info(State(state): State<Arc<HlsServerState>>) -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "code": state.access_code,
+        "port": state.port,
+    }))
+}
+
+
+// Serve HLS segment files with auth
+async fn serve_hls_file(
+    path: axum::extract::Path<String>,
+    State(state): State<Arc<HlsServerState>>,
+    headers: axum::http::HeaderMap,
+    query: axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let path_str = path.as_str();
+    eprintln!("📦 Request for segment: {}", path_str);
+    
+    // Validate access code for segment files
+    let provided_code = headers
+        .get("x-access-code")
+        .and_then(|h| h.to_str().ok())
+        .or_else(|| query.get("code").map(|s| s.as_str()));
+    
+    if let Some(code) = provided_code {
+        if code != state.access_code {
+            eprintln!("❌ Invalid access code for segment: {}", path_str);
+            return Err(StatusCode::FORBIDDEN);
+        }
+    } else {
+        eprintln!("❌ No access code provided for segment: {}", path_str);
+        return Err(StatusCode::FORBIDDEN);
+    }
+    
+    // Construct full filename (path is like "012.ts" from route "/segment_:path")
+    let filename = format!("segment_{}", path_str);
+    let file_path = state.public_dir.join(&filename);
+    
+    eprintln!("📁 Looking for file: {}", file_path.display());
+    eprintln!("📁 Public dir: {}", state.public_dir.display());
+    
+    if file_path.exists() {
+        eprintln!("✅ Found segment file: {}", filename);
+        let content = fs::read(&file_path).map_err(|e| {
+            eprintln!("❌ Error reading file: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        let content_type = "video/mp2t";
+        
+        Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, content_type)],
+            content,
+        ))
+    } else {
+        eprintln!("❌ Segment file not found: {}", filename);
+        // List files in directory for debugging
+        if let Ok(entries) = fs::read_dir(&state.public_dir) {
+            eprintln!("📂 Files in public dir:");
+            for entry in entries.flatten() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    eprintln!("  - {}", name);
+                }
+            }
+        }
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+// Start HLS server
+async fn start_hls_server(state: Arc<HlsServerState>) -> anyhow::Result<()> {
+    use axum::routing::get;
+    
+    // Handler for stream.m3u8 (no path param)
+    async fn serve_stream_m3u8(
+        State(state): State<Arc<HlsServerState>>,
+        headers: axum::http::HeaderMap,
+        query: axum::extract::Query<std::collections::HashMap<String, String>>,
+    ) -> Result<impl IntoResponse, StatusCode> {
+        // Validate access code
+        let provided_code = headers
+            .get("x-access-code")
+            .and_then(|h| h.to_str().ok())
+            .or_else(|| query.get("code").map(|s| s.as_str()));
+        
+        if let Some(code) = provided_code {
+            if code != state.access_code {
+                return Err(StatusCode::FORBIDDEN);
+            }
+        } else {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        
+        let file_path = state.public_dir.join("stream.m3u8");
+        if file_path.exists() {
+            let content = fs::read(&file_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            Ok((
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
+                content,
+            ))
+        } else {
+            Err(StatusCode::NOT_FOUND)
+        }
+    }
+    
+    // Handler for segment files using a catch-all approach
+    async fn serve_segment_catchall(
+        uri: axum::http::Uri,
+        State(state): State<Arc<HlsServerState>>,
+        headers: axum::http::HeaderMap,
+        query: axum::extract::Query<std::collections::HashMap<String, String>>,
+    ) -> Result<impl IntoResponse, StatusCode> {
+        let path = uri.path().trim_start_matches('/');
+        eprintln!("📦 Request for: {}", path);
+        
+        // Only handle segment files
+        if !path.starts_with("segment_") || !path.ends_with(".ts") {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        
+        // Validate access code
+        let provided_code = headers
+            .get("x-access-code")
+            .and_then(|h| h.to_str().ok())
+            .or_else(|| query.get("code").map(|s| s.as_str()));
+        
+        if let Some(code) = provided_code {
+            if code != state.access_code {
+                eprintln!("❌ Invalid access code for segment: {}", path);
+                return Err(StatusCode::FORBIDDEN);
+            }
+        } else {
+            eprintln!("❌ No access code provided for segment: {}", path);
+            return Err(StatusCode::FORBIDDEN);
+        }
+        
+        let file_path = state.public_dir.join(path);
+        eprintln!("📁 Looking for file: {}", file_path.display());
+        
+        if file_path.exists() {
+            eprintln!("✅ Found segment file: {}", path);
+            let content = fs::read(&file_path).map_err(|e| {
+                eprintln!("❌ Error reading file: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            
+            Ok((
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "video/mp2t")],
+                content,
+            ))
+        } else {
+            eprintln!("❌ Segment file not found: {}", path);
+            // List files in directory for debugging
+            if let Ok(entries) = fs::read_dir(&state.public_dir) {
+                eprintln!("📂 Files in public dir:");
+                for entry in entries.flatten() {
+                    if let Ok(name) = entry.file_name().into_string() {
+                        eprintln!("  - {}", name);
+                    }
+                }
+            }
+            Err(StatusCode::NOT_FOUND)
+        }
+    }
+    
+    use axum::routing::any;
+    
+    let app = Router::new()
+        .route("/api/info", get(hls_api_info))
+        .route("/stream.m3u8", get(serve_stream_m3u8))
+        .fallback(any(serve_segment_catchall))
+        .layer(CorsLayer::permissive())
+        .with_state(state.clone());
+    
+    let addr = format!("127.0.0.1:{}", state.port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    eprintln!("✅ HLS server started on http://{}", addr);
+    eprintln!("   Access code: {}", state.access_code);
+    
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+// Tauri command to start HLS server
+#[tauri::command]
+async fn start_hls_server_cmd(
+    state: tauri::State<'_, Arc<Mutex<Option<HlsServerHandle>>>>,
+    app_handle: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    // Check if server is already running
+    {
+        let mut handle_opt = state.lock().unwrap();
+        if handle_opt.is_some() {
+            return Err("HLS server is already running".to_string());
+        }
+    }
+    
+    // Get app data directory for public folder
+    let app_data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    let public_dir = app_data_dir.join("hls_public");
+    
+    // Generate access code
+    let access_code = generate_access_code();
+    let port = 3000u16;
+    
+    let hls_state = Arc::new(HlsServerState {
+        access_code: access_code.clone(),
+        port,
+        public_dir: public_dir.clone(),
+    });
+    
+    // Start FFmpeg
+    let ffmpeg_handle = start_ffmpeg(&public_dir)
+        .await
+        .map_err(|e| format!("Failed to start FFmpeg: {}", e))?;
+    
+    // Start HTTP server
+    let server_state = hls_state.clone();
+    let server_handle = tokio::spawn(async move {
+        start_hls_server(server_state).await
+    });
+    
+    // Start localtunnel
+    let (tunnel_handle, tunnel_url, tunnel_domain) = match start_localtunnel(port).await {
+        Ok((handle, url, domain)) => {
+            eprintln!("✅ Tunnel created: {}", url);
+            eprintln!("   Domain: {}", domain);
+            (Some(handle), Some(url), Some(domain))
+        }
+        Err(e) => {
+            eprintln!("⚠️  Failed to create tunnel: {}", e);
+            eprintln!("   Server still running on localhost - tunnel creation failed");
+            (None, None, None)
+        }
+    };
+    
+    // Store handle
+    {
+        let mut handle_opt = state.lock().unwrap();
+        *handle_opt = Some(HlsServerHandle {
+            ffmpeg_handle: Some(ffmpeg_handle),
+            server_handle,
+            tunnel_handle,
+            access_code: access_code.clone(),
+            port,
+            tunnel_url: tunnel_url.clone(),
+            tunnel_domain: tunnel_domain.clone(),
+        });
+    }
+    
+    let mut response = serde_json::json!({
+        "code": access_code,
+        "port": port,
+        "url": format!("http://localhost:{}", port),
+    });
+    
+    if let (Some(ref url), Some(ref domain)) = (tunnel_url, tunnel_domain) {
+        response["tunnelUrl"] = serde_json::Value::String(url.clone());
+        response["tunnelDomain"] = serde_json::Value::String(domain.clone());
+    }
+    
+    Ok(response)
+}
+
+// Tauri command to stop HLS server
+#[tauri::command]
+async fn stop_hls_server_cmd(
+    state: tauri::State<'_, Arc<Mutex<Option<HlsServerHandle>>>>,
+) -> Result<(), String> {
+    let handle_opt = {
+        let mut guard = state.lock().unwrap();
+        guard.take()
+    };
+    
+    if let Some(mut handle) = handle_opt {
+        // Kill FFmpeg
+        if let Some(mut ffmpeg) = handle.ffmpeg_handle.take() {
+            let _ = ffmpeg.kill().await;
+        }
+        // Kill tunnel
+        if let Some(mut tunnel) = handle.tunnel_handle.take() {
+            let _ = tunnel.kill().await;
+        }
+        // Abort server task
+        handle.server_handle.abort();
+        Ok(())
+    } else {
+        Err("HLS server is not running".to_string())
+    }
+}
+
+// Tauri command to get HLS server info
+#[tauri::command]
+async fn get_hls_server_info(
+    state: tauri::State<'_, Arc<Mutex<Option<HlsServerHandle>>>>,
+) -> Result<Option<serde_json::Value>, String> {
+    let handle_opt = state.lock().unwrap();
+    if let Some(handle) = handle_opt.as_ref() {
+        let mut info = serde_json::json!({
+            "running": true,
+            "code": handle.access_code,
+            "port": handle.port,
+            "url": format!("http://localhost:{}", handle.port),
+        });
+        
+        if let Some(ref tunnel_url) = handle.tunnel_url {
+            info["tunnelUrl"] = serde_json::Value::String(tunnel_url.clone());
+        }
+        if let Some(ref tunnel_domain) = handle.tunnel_domain {
+            info["tunnelDomain"] = serde_json::Value::String(tunnel_domain.clone());
+        }
+        
+        Ok(Some(info))
+    } else {
+        Ok(None)
+    }
 }
 
 pub fn run() {
@@ -1611,9 +1234,9 @@ pub fn run() {
             // Start clipboard monitor
             start_clipboard_monitor(app.handle().clone(), db.clone());
 
-            // Initialize signaling server state
-            let signaling_state = Arc::new(Mutex::new(None::<Arc<SignalingServerState>>));
-            app.manage(signaling_state);
+            // Initialize HLS server state
+            let hls_server_state = Arc::new(Mutex::new(None::<HlsServerHandle>));
+            app.manage(hls_server_state);
 
             #[cfg(desktop)]
             {
@@ -1639,9 +1262,10 @@ pub fn run() {
             open_file,
             refresh_file_index,
             hide_window,
-            start_signaling_server_cmd,
-            get_signaling_server_url,
-            open_browser_url,
+            check_ffmpeg,
+            start_hls_server_cmd,
+            stop_hls_server_cmd,
+            get_hls_server_info,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri");

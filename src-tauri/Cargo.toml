@@ -32,4 +32,5 @@ tokio = { version = "1", features = ["full"] }
 futures-util = "0.3"
 anyhow = "1.0"
 axum = { version = "0.7", features = ["macros", "ws"] }
-tower-http = { version = "0.5", features = ["cors"] }
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+rand = "0.8"
