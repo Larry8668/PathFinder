@@ -1142,11 +1142,25 @@ async fn start_hls_server(state: Arc<HlsServerState>) -> anyhow::Result<()> {
     }
     
     // Helper to track viewer
-    fn track_viewer(state: &Arc<HlsServerState>, ip: String) {
+    // For better tracking, we use IP + User-Agent as a unique identifier
+    // This helps distinguish multiple clients behind the same tunnel
+    fn track_viewer(state: &Arc<HlsServerState>, ip: String, user_agent: Option<&str>) {
         let mut viewers = state.viewers.lock().unwrap();
-        viewers.insert(ip, SystemTime::now());
+        
+        // Create a unique viewer ID from IP and User-Agent
+        let viewer_id = if let Some(ua) = user_agent {
+            format!("{}|{}", ip, ua)
+        } else {
+            ip.clone()
+        };
+        
+        let was_new = !viewers.contains_key(&viewer_id);
+        viewers.insert(viewer_id.clone(), SystemTime::now());
         let count = viewers.len();
-        eprintln!("👥 Viewer tracked. Total viewers: {}", count);
+        
+        if was_new {
+            eprintln!("👥 New viewer connected: {} (Total: {})", ip, count);
+        }
     }
     
     // Handler for stream.m3u8 (no path param)
@@ -1171,7 +1185,9 @@ async fn start_hls_server(state: Arc<HlsServerState>) -> anyhow::Result<()> {
         
         // Track viewer
         let client_ip = get_client_ip(&headers);
-        track_viewer(&state, client_ip);
+        let user_agent = headers.get("user-agent")
+            .and_then(|h| h.to_str().ok());
+        track_viewer(&state, client_ip, user_agent);
         
         let file_path = state.public_dir.join("stream.m3u8");
         if file_path.exists() {
@@ -1219,7 +1235,9 @@ async fn start_hls_server(state: Arc<HlsServerState>) -> anyhow::Result<()> {
         
         // Track viewer (update timestamp to keep them active)
         let client_ip = get_client_ip(&headers);
-        track_viewer(&state, client_ip);
+        let user_agent = headers.get("user-agent")
+            .and_then(|h| h.to_str().ok());
+        track_viewer(&state, client_ip, user_agent);
         
         let file_path = state.public_dir.join(path);
         eprintln!("📁 Looking for file: {}", file_path.display());
@@ -1253,19 +1271,27 @@ async fn start_hls_server(state: Arc<HlsServerState>) -> anyhow::Result<()> {
     
     use axum::routing::any;
     
-    // Spawn cleanup task to remove stale viewers (older than 30 seconds)
+    // Spawn cleanup task to remove stale viewers (older than 15 seconds)
+    // HLS clients typically request segments every 2 seconds, so 15 seconds is a safe timeout
     let cleanup_state = state.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
         loop {
             interval.tick().await;
             let mut viewers = cleanup_state.viewers.lock().unwrap();
             let now = SystemTime::now();
             let before_count = viewers.len();
-            viewers.retain(|_ip, last_seen| {
+            let timeout_secs = 15; // Remove viewers inactive for 15 seconds
+            
+            viewers.retain(|ip, last_seen| {
                 if let Ok(duration) = now.duration_since(*last_seen) {
-                    duration.as_secs() < 30 // Keep viewers active for 30 seconds
+                    let is_active = duration.as_secs() < timeout_secs;
+                    if !is_active {
+                        eprintln!("  🗑️  Removing inactive viewer: {} (last seen {}s ago)", ip, duration.as_secs());
+                    }
+                    is_active
                 } else {
+                    eprintln!("  🗑️  Removing viewer with invalid timestamp: {}", ip);
                     false
                 }
             });
