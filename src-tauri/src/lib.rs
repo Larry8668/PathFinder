@@ -731,29 +731,148 @@ async fn list_ffmpeg_devices() -> Result<serde_json::Value, String> {
 // Check if localtunnel is available (via npx)
 #[tauri::command]
 async fn check_localtunnel() -> Result<bool, String> {
-    // Check if npx is available
-    let npx_check = Command::new("npx")
-        .arg("--version")
-        .output()
-        .await;
-    
-    if npx_check.is_err() {
+    // On Windows, try cmd.exe /c npx first, then direct npx
+    #[cfg(target_os = "windows")]
+    {
+        // Try cmd.exe /c npx (Windows command prompt)
+        let npx_check = Command::new("cmd")
+            .args(&["/C", "npx", "--version"])
+            .output()
+            .await;
+        
+        if npx_check.is_ok() && npx_check.as_ref().unwrap().status.success() {
+            return Ok(true);
+        }
+        
+        // Fallback: try direct npx (might work if Node.js is in PATH)
+        let npx_direct = Command::new("npx")
+            .arg("--version")
+            .output()
+            .await;
+        
+        if npx_direct.is_ok() && npx_direct.as_ref().unwrap().status.success() {
+            return Ok(true);
+        }
+        
+        // Check if Node.js is installed by checking common locations
+        let node_check = Command::new("cmd")
+            .args(&["/C", "node", "--version"])
+            .output()
+            .await;
+        
+        if node_check.is_ok() && node_check.as_ref().unwrap().status.success() {
+            // Node.js exists but npx might not be in PATH
+            // This is still considered "available" as npx comes with npm
+            return Ok(true);
+        }
+        
         return Ok(false);
     }
     
-    // Try to run localtunnel --help (this will download it if needed, but we just check if it works)
-    // Actually, we'll just check if npx works - localtunnel will be downloaded on first use
-    Ok(true)
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Check if npx is available (macOS/Linux)
+        let npx_check = Command::new("npx")
+            .arg("--version")
+            .output()
+            .await;
+        
+        if npx_check.is_err() {
+            return Ok(false);
+        }
+        
+        Ok(true)
+    }
 }
 
 // Start localtunnel and parse the URL
 async fn start_localtunnel(port: u16) -> anyhow::Result<(tokio::process::Child, String, String)> {
-    let mut cmd = Command::new("npx");
-    cmd.args(&["-y", "localtunnel", "--port", &port.to_string()]);
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    {
+        // On Windows, try multiple methods to run npx
+        // Method 1: Try cmd.exe /C npx (works if npx is in PATH)
+        let mut cmd = Command::new("cmd");
+        cmd.args(&["/C", "npx", "-y", "localtunnel", "--port", &port.to_string()]);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.stdin(Stdio::null()); // Prevent cmd from waiting for input
+        
+        match cmd.spawn() {
+            Ok(child) => {
+                eprintln!("✅ Started localtunnel via cmd.exe /C npx");
+                return start_localtunnel_common(child, port).await;
+            }
+            Err(e1) => {
+                eprintln!("⚠️  Failed to start localtunnel via cmd.exe /C npx: {}", e1);
+                
+                // Method 2: Try npx.cmd directly (Windows-specific)
+                let mut cmd2 = Command::new("npx.cmd");
+                cmd2.args(&["-y", "localtunnel", "--port", &port.to_string()]);
+                cmd2.stdout(Stdio::piped());
+                cmd2.stderr(Stdio::piped());
+                
+                match cmd2.spawn() {
+                    Ok(child) => {
+                        eprintln!("✅ Started localtunnel via npx.cmd");
+                        return start_localtunnel_common(child, port).await;
+                    }
+                    Err(e2) => {
+                        eprintln!("⚠️  Failed to start localtunnel via npx.cmd: {}", e2);
+                        
+                        // Method 3: Try npx directly (might work if Node.js is in PATH)
+                        let mut cmd3 = Command::new("npx");
+                        cmd3.args(&["-y", "localtunnel", "--port", &port.to_string()]);
+                        cmd3.stdout(Stdio::piped());
+                        cmd3.stderr(Stdio::piped());
+                        
+                        match cmd3.spawn() {
+                            Ok(child) => {
+                                eprintln!("✅ Started localtunnel via npx directly");
+                                return start_localtunnel_common(child, port).await;
+                            }
+                            Err(e3) => {
+                                eprintln!("⚠️  Failed to start localtunnel via npx directly: {}", e3);
+                                return Err(anyhow::anyhow!(
+                                    "Failed to start localtunnel. Tried multiple methods:\n\
+                                    1. cmd.exe /C npx: {}\n\
+                                    2. npx.cmd: {}\n\
+                                    3. npx: {}\n\n\
+                                    Make sure Node.js and npm are installed and in your PATH.\n\
+                                    On Windows, install Node.js from https://nodejs.org/ and restart your terminal/application.",
+                                    e1, e2, e3
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     
-    let mut child = cmd.spawn()?;
+    #[cfg(not(target_os = "windows"))]
+    {
+        // On macOS/Linux, use npx directly
+        let mut cmd = Command::new("npx");
+        cmd.args(&["-y", "localtunnel", "--port", &port.to_string()]);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        
+        let child = cmd.spawn().map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to start localtunnel: {}. Make sure Node.js and npm are installed and in your PATH.",
+                e
+            )
+        })?;
+        
+        return start_localtunnel_common(child, port).await;
+    }
+}
+
+// Common logic for parsing localtunnel output (shared between platforms)
+async fn start_localtunnel_common(
+    mut child: tokio::process::Child,
+    _port: u16,
+) -> anyhow::Result<(tokio::process::Child, String, String)> {
     
     // Wait a bit for localtunnel to start and output the URL
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
